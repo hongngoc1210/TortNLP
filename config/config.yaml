@@ -1,0 +1,71 @@
+seed: 42
+
+data:
+  train_path: "datasets/train001.jsonl"
+
+model:
+  encoder_name:        "sbintuitions/modernbert-ja-310m"
+
+  # [A1] Claim self-attention
+  use_self_attention:   true
+  self_attn_heads:      4
+  self_attn_dropout:    0.1
+
+  # P↔D cross-attention
+  use_cross_attention:  true
+  cross_attn_heads:     4
+  cross_attn_dropout:   0.1
+
+  # TD head
+  td_num_heads:         4
+  td_dropout:           0.2
+  use_label_attn:       true
+  num_experts:          4      # [A3] MoE
+
+training:
+  epochs:                   25
+  batch_size:               16
+  lr:                     2e-5
+  weight_decay:           1e-2
+  warmup_ratio:           0.06
+  grad_accum_steps:          4
+  max_grad_norm:           1.0
+  early_stopping_patience:   5
+
+teacher_forcing:
+  start:   1.0
+  end:     0.0
+  epochs:  10
+
+loss:
+  # [B1] Focal Loss for RE
+  focal_gamma:           0.5    # 0.5 = giữa BCE(0) và linear(1), tránh collapse
+  focal_alpha:           0.75   # UP-WEIGHT positives: alpha ≈ N_neg/(N_pos+N_neg)
+
+  # [B2] Asymmetric Loss for TD
+  asl_gamma_pos:         0.0
+  asl_gamma_neg:         2.0    # giảm từ 4.0 → tránh easy neg collapse sau 3 epoch
+  asl_clip:              0.0    # tắt clip → gradient alive cho easy negatives
+
+  # [B3] Uncertainty weighting
+  # Để false cho đến khi RE_F1 > 0.1, sau đó có thể bật lại
+  uncertainty_weighting: false
+
+  # Fixed lambdas (active khi uncertainty_weighting: false)
+  lambda_re:             2.0    # tăng từ 1.0 → bù cho focal loss scale thấp hơn
+  lambda_td:             1.0
+
+  # Auxiliary losses
+  lambda_contrastive:    0.1    # [A2]
+  lambda_moe:            0.01   # [A3]
+  lambda_consistency:    0.3    # [B4] giảm từ 0.5 → tránh át gradient RE
+  consistency_margin:    0.1    # [B4]
+
+  # [A2] Contrastive pooling
+  contrastive_temp:      0.07
+  use_contrastive_loss:  true
+
+system:
+  device:      "cuda"
+  num_workers:  2
+  save_dir:    "outputs/run_01"
