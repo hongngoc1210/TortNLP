@@ -9,12 +9,8 @@ from data_utils.dataset       import LegalDataset
 from data_utils               import collate_fn, seed_worker
 from data_utils.split         import train_dev_test_split
 
-from models.shared_encoder import Stage1Encoder
-from models.re_module      import RationableExtraction
-from models.pooling        import RationalePooling
-from models.td_head        import TDHead
+from models.factory import build_model_stages
 
-from losses.multitask_loss import MultiTaskLoss
 from trainer.engine        import Trainer
 from trainer.scheduler     import TeacherForcingScheduler
 
@@ -94,31 +90,9 @@ def build_loaders(cfg, rank: int, world_size: int):
 # =============================================================================
 
 def build_models(cfg, device):
-    """
-    BUG 7 FIX: truyền đầy đủ params mới cho Stage1Encoder và TDHead.
-    Trả về raw models — DDP wrapping được làm ở main_2x.py sau khi
-    sync BatchNorm (nếu có) và kiểm soát find_unused_parameters.
-    """
+    """Build the same CAER-MTL stages used by the single-GPU pipeline."""
 
-    stage1 = Stage1Encoder(
-        model_name          = cfg["model"]["encoder_name"],
-        cross_attn_heads    = cfg["model"].get("cross_attn_heads",    4),
-        cross_attn_dropout  = cfg["model"].get("cross_attn_dropout",  0.1),
-        use_cross_attention = cfg["model"].get("use_cross_attention",  True),
-    ).to(device)
-
-    hidden = stage1.encoder.hidden_size
-
-    stage2 = RationableExtraction(hidden).to(device)
-    stage3 = RationalePooling(hidden).to(device)
-    stage4 = TDHead(
-        hidden         = hidden,
-        num_heads      = cfg["model"].get("td_num_heads",   4),
-        dropout        = cfg["model"].get("td_dropout",     0.2),
-        use_label_attn = cfg["model"].get("use_label_attn", True),
-    ).to(device)
-
-    return stage1, stage2, stage3, stage4
+    return build_model_stages(cfg, device=device)
 
 
 # =============================================================================

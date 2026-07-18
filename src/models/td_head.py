@@ -1,308 +1,182 @@
-"""
-td_head.py
+"""Stage 4: tort prediction with explicit ablation modes."""
 
-Modules trong file này (theo thứ tự gọi trong TDHead.forward):
-  1. REStatsGate              — gate H_re_p/d theo confidence của RE
-  2. FeatureAttention         — self-attention trên N feature tokens [A2 existing]
-  3. LabelConditionedAttention — teacher forcing signal
-  4. TDMoE                   — [A3] Mixture of Experts thay thế MLP đơn lẻ
-"""
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+from .attention import RationaleBiasedCrossAttention, valid_num_heads
 
-# =============================================================================
-#  REStatsGate
-# =============================================================================
-
-class REStatsGate(nn.Module):
-    """Gate H_re_p và H_re_d theo độ tự tin của RE."""
-
-    def __init__(self, hidden: int, stats_dim: int = 4):
-        super().__init__()
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(stats_dim * 2, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.Sigmoid(),
-        )
-        self.norm_p = nn.LayerNorm(hidden)
-        self.norm_d = nn.LayerNorm(hidden)
-
-    def forward(self, H_re_p, H_re_d, stats_P, stats_D):
-        gate = self.gate_mlp(torch.cat([stats_P, stats_D], dim=-1))
-        return self.norm_p(H_re_p * gate), self.norm_d(H_re_d * (1.0 - gate))
-
-
-# =============================================================================
-#  FeatureAttention
-# =============================================================================
-
-class FeatureAttention(nn.Module):
-    """
-    Self-attention trên N feature tokens, pool bằng learned CLS query.
-    Tokens: [H_u, H_re_p_gated, H_re_d_gated, delta, prod]
-    """
-
-    def __init__(self, hidden: int, num_heads: int = 4, dropout: float = 0.1):
-        super().__init__()
-        assert hidden % num_heads == 0
-        self.hidden    = hidden
-        self.num_heads = num_heads
-        self.head_dim  = hidden // num_heads
-        self.scale     = self.head_dim ** -0.5
-
-        self.qkv  = nn.Linear(hidden, hidden * 3, bias=False)
-        self.proj = nn.Linear(hidden, hidden, bias=False)
-        self.norm1 = nn.LayerNorm(hidden)
-        self.norm2 = nn.LayerNorm(hidden)
-        self.ff    = nn.Sequential(
-            nn.Linear(hidden, hidden * 2), nn.GELU(),
-            nn.Dropout(dropout), nn.Linear(hidden * 2, hidden),
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.cls_q   = nn.Parameter(torch.zeros(1, 1, hidden))
-        nn.init.trunc_normal_(self.cls_q, std=0.02)
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        B, N, H = tokens.shape
-        nh, d   = self.num_heads, self.head_dim
-
-        normed  = self.norm1(tokens)
-        q, k, v = self.qkv(normed).chunk(3, dim=-1)
-
-        q = q.view(B, N, nh, d).transpose(1, 2)
-        k = k.view(B, N, nh, d).transpose(1, 2)
-        v = v.view(B, N, nh, d).transpose(1, 2)
-
-        attn    = F.softmax(torch.matmul(q, k.transpose(-2, -1)) * self.scale, dim=-1)
-        attn    = self.dropout(attn)
-        ctx     = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, N, H)
-
-        tokens  = tokens + self.proj(ctx)
-        tokens  = tokens + self.ff(self.norm2(tokens))
-
-        cls_q   = self.cls_q.expand(B, -1, -1).view(B, 1, nh, d).transpose(1, 2)
-        k2      = tokens.view(B, N, nh, d).transpose(1, 2)
-        pool_attn = F.softmax(torch.matmul(cls_q, k2.transpose(-2, -1)) * self.scale, dim=-1)
-        pooled  = torch.matmul(pool_attn, k2).transpose(1, 2).contiguous().view(B, H)
-
-        return pooled
-
-
-# =============================================================================
-#  LabelConditionedAttention
-# =============================================================================
-
-class LabelConditionedAttention(nn.Module):
-    """Teacher forcing: prepend label token vào feature sequence."""
-
-    def __init__(self, hidden: int, stats_dim: int = 4):
-        super().__init__()
-        self.label_proj = nn.Linear(stats_dim * 2, hidden)
-        self.norm       = nn.LayerNorm(hidden)
-
-    def forward(self, feature_tokens, stats_P_gt, stats_D_gt):
-        label_vec   = self.label_proj(torch.cat([stats_P_gt, stats_D_gt], dim=-1))
-        label_token = self.norm(label_vec).unsqueeze(1)               # [B, 1, H]
-        return torch.cat([label_token, feature_tokens], dim=1)        # [B, N+1, H]
-
-
-# =============================================================================
-#  [A3] TDMoE — Mixture of Experts
-#
-#  Thay thế MLP đơn lẻ trong TD head. Mỗi expert chuyên về 1 loại pattern
-#  (ví dụ: negligence, defamation, nuisance). Gate được điều khiển bởi H_u
-#  (global facts) — loại case được phản ánh trong undisputed facts.
-#
-#  Thiết kế:
-#    - num_experts expert MLPs, mỗi cái nhận pooled vector
-#    - Soft gate từ H_u → [B, num_experts] weights
-#    - Output = weighted sum của expert outputs
-#    - load_balance_loss để tránh collapse về 1 expert
-# =============================================================================
-
-class TDMoE(nn.Module):
-
-    def __init__(
-        self,
-        input_dim:    int,
-        hidden:       int,
-        num_experts:  int   = 4,
-        dropout:      float = 0.2,
-    ):
-        super().__init__()
-
-        self.num_experts = num_experts
-
-        # Mỗi expert là 1 MLP nhỏ
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, hidden),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden, hidden // 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden // 2, 1),
-            )
-            for _ in range(num_experts)
-        ])
-
-        # Gate: H_u → soft distribution trên experts
-        # Dùng H_u vì global facts mô tả loại case tốt nhất
-        self.gate = nn.Sequential(
-            nn.Linear(hidden, hidden // 2),
-            nn.GELU(),
-            nn.Linear(hidden // 2, num_experts),
-        )
-
-        # Noise để khuyến khích exploration trong training (Shazeer 2017)
-        self.gate_noise = nn.Linear(hidden, num_experts, bias=False)
-
-    def forward(
-        self,
-        x:        torch.Tensor,   # [B, input_dim]  — pooled features
-        H_u:      torch.Tensor,   # [B, hidden]      — gate signal
-        training: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          logits          : [B]       — TD prediction logits
-          load_balance_loss : scalar  — auxiliary loss để balance experts
-        """
-        B = x.size(0)
-
-        # Gate scores
-        gate_logits = self.gate(H_u)   # [B, num_experts]
-
-        if training:
-            # Jitter noise để tránh collapse (standard MoE trick)
-            noise = torch.randn_like(gate_logits) * F.softplus(self.gate_noise(H_u))
-            gate_logits = gate_logits + noise
-
-        gate_weights = F.softmax(gate_logits, dim=-1)   # [B, E]
-
-        # Chạy tất cả experts, stack lại
-        expert_logits = torch.stack(
-            [expert(x).squeeze(-1) for expert in self.experts],
-            dim=1,
-        )   # [B, num_experts]
-
-        # Weighted sum
-        logits = (gate_weights * expert_logits).sum(dim=1)   # [B]
-
-        # Load balance loss: khuyến khích phân phối đều trên experts
-        # = variance của mean gate weights trên batch (thấp = đều)
-        mean_gate = gate_weights.mean(dim=0)   # [E]
-        load_balance_loss = (mean_gate * torch.log(mean_gate + 1e-8)).sum().neg()
-        # Dùng entropy của distribution — cao = đều = tốt → minimize negative entropy
-
-        return logits, load_balance_loss
-
-
-# =============================================================================
-#  TDHead (updated)
-#
-#  Thay đổi so với version trước:
-#    [A3] TDMoE thay thế MLP đơn lẻ ở bước prediction cuối
-#         gate dùng H_u, load_balance_loss được trả về để thêm vào total loss
-# =============================================================================
 
 class TDHead(nn.Module):
+    """Verdict head.
+
+    ``input_mode`` controls the TP-path ablation:
+      - ``rationale``: full current architecture.
+      - ``global_only``: only the global undisputed-facts representation.
+
+    ``use_global_residual`` adds a conservative residual route from global
+    context to the full rationale-based interaction representation.
+    """
 
     def __init__(
         self,
-        hidden:         int,
-        num_heads:      int   = 4,
-        dropout:        float = 0.2,
-        stats_dim:      int   = 4,
-        use_label_attn: bool  = True,
-        num_experts:    int   = 4,    # [A3]
-    ):
+        hidden: int,
+        num_heads: int = 8,
+        dropout: float = 0.2,
+        input_mode: str = "rationale",
+        use_global_residual: bool = False,
+        rationale_scale_init: float = -1.5,
+    ) -> None:
         super().__init__()
 
-        self.use_label_attn = use_label_attn
+        if input_mode not in {"rationale", "global_only"}:
+            raise ValueError(f"Unknown TDHead input_mode={input_mode!r}")
+        self.input_mode = input_mode
+        self.use_global_residual = bool(use_global_residual)
 
-        self.re_gate = REStatsGate(hidden, stats_dim)
+        heads = valid_num_heads(hidden, num_heads)
 
-        if use_label_attn:
-            self.label_attn = LabelConditionedAttention(hidden, stats_dim)
-
-        self.feat_attn = FeatureAttention(hidden, num_heads, dropout)
-
-        # [A3] MoE thay thế MLP đơn
-        # input_dim = pooled (hidden) + stats (8)
-        self.moe = TDMoE(
-            input_dim   = hidden + stats_dim * 2,
-            hidden      = hidden,
-            num_experts = num_experts,
-            dropout     = dropout,
+        self.global_verdict_mlp = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 1),
         )
 
-    def forward(
-        self,
-        stage1_out:  dict,
-        stage3_out:  dict,
-        gt_stats_P:  torch.Tensor | None = None,
-        gt_stats_D:  torch.Tensor | None = None,
-    ) -> dict:
-
-        H_u     = stage1_out["H_u"]
-        H_re_p  = stage3_out["H_re_p"]
-        H_re_d  = stage3_out["H_re_d"]
-        stats_P = stage3_out["stats_P"]
-        stats_D = stage3_out["stats_D"]
-
-        # 1. RE Stats Gate
-        H_re_p_g, H_re_d_g = self.re_gate(H_re_p, H_re_d, stats_P, stats_D)
-
-        # 2. Feature tokens
-        delta  = H_re_p_g - H_re_d_g
-        prod   = H_re_p_g * H_re_d_g
-        tokens = torch.stack([H_u, H_re_p_g, H_re_d_g, delta, prod], dim=1)
-
-        # 3. Label-conditioned attention (training only)
-        use_label = (
-            self.use_label_attn and self.training
-            and gt_stats_P is not None and gt_stats_D is not None
+        self.plaintiff_query = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.LayerNorm(hidden),
         )
-        if use_label:
-            tokens = self.label_attn(tokens, gt_stats_P, gt_stats_D)
+        self.defendant_query = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.LayerNorm(hidden),
+        )
 
-        # 4. Feature attention
-        pooled = self.feat_attn(tokens)   # [B, hidden]
+        self.plaintiff_cross_attention = RationaleBiasedCrossAttention(
+            hidden, heads, dropout=dropout
+        )
+        self.defendant_cross_attention = RationaleBiasedCrossAttention(
+            hidden, heads, dropout=dropout
+        )
 
-        # 5. [A3] MoE prediction
-        x = torch.cat([pooled, stats_P, stats_D], dim=-1)
+        self.feature_type_embedding = nn.Parameter(torch.empty(8, hidden))
+        nn.init.normal_(self.feature_type_embedding, mean=0.0, std=0.02)
 
-        logits, load_balance_loss = self.moe(x, H_u, training=self.training)
+        reasoner_layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=heads,
+            dim_feedforward=hidden * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.interaction_reasoner = nn.TransformerEncoder(
+            reasoner_layer, num_layers=1
+        )
 
-        probs = torch.sigmoid(logits)
+        self.feature_pool_query = nn.Parameter(torch.empty(hidden))
+        nn.init.normal_(self.feature_pool_query, mean=0.0, std=0.02)
 
+        self.global_residual_norm = nn.LayerNorm(hidden)
+        self.rationale_scale = nn.Parameter(torch.tensor(float(rationale_scale_init)))
+
+        self.verdict_mlp = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 1),
+        )
+
+    @staticmethod
+    def _empty_diagnostics(H_u: torch.Tensor) -> dict:
+        batch_size = H_u.size(0)
         return {
-            "T_logit":           logits,
-            "T_hat":             probs,
-            "load_balance_loss": load_balance_loss,   # [A3] cho MultiTaskLoss
+            "verdict_attention_P": H_u.new_zeros((batch_size, 0)),
+            "verdict_attention_D": H_u.new_zeros((batch_size, 0)),
+            "feature_attention": H_u.new_zeros((batch_size, 0)),
+            "Z_p": H_u.new_zeros(H_u.shape),
+            "Z_d": H_u.new_zeros(H_u.shape),
         }
 
+    def forward(self, stage1_out, stage3_out=None, input_mode: str | None = None):
+        mode = input_mode or self.input_mode
+        if mode not in {"rationale", "global_only"}:
+            raise ValueError(f"Unknown TP input mode={mode!r}")
 
-# =============================================================================
-#  TDLoss — interface không thay đổi
-# =============================================================================
+        if stage3_out is not None and "H_u_tp" in stage3_out:
+            H_u = stage3_out["H_u_tp"]
+        else:
+            H_u = stage1_out["H_u"]
 
-class TDLoss(nn.Module):
+        if mode == "global_only":
+            T_logit = self.global_verdict_mlp(H_u).squeeze(-1)
+            T_hat = torch.sigmoid(T_logit)
+            return {
+                "T_logit": T_logit,
+                "T_hat": T_hat,
+                **self._empty_diagnostics(H_u),
+            }
 
-    def __init__(self):
-        super().__init__()
-        self.loss_fn = nn.BCEWithLogitsLoss()
+        if stage3_out is None:
+            raise ValueError("stage3_out is required for rationale TP mode")
 
-    def forward(self, outputs: dict, batch: dict) -> torch.Tensor:
-        logits = outputs["T_logit"]
-        labels = batch["T"].float()
-        mask   = labels >= 0
-        if not mask.any():
-            return torch.tensor(0.0, device=logits.device)
-        return self.loss_fn(logits[mask], labels[mask])
+        H_p = stage3_out["H_re_p"]
+        H_d = stage3_out["H_re_d"]
+
+        q_p = self.plaintiff_query(H_u)
+        q_d = self.defendant_query(H_u)
+
+        Z_p, verdict_attention_P = self.plaintiff_cross_attention(
+            query=q_p,
+            tokens=stage3_out["top_tokens_P"],
+            token_mask=stage3_out["top_mask_P"],
+            rationale_scores=stage3_out["top_scores_P"],
+        )
+        Z_d, verdict_attention_D = self.defendant_cross_attention(
+            query=q_d,
+            tokens=stage3_out["top_tokens_D"],
+            token_mask=stage3_out["top_mask_D"],
+            rationale_scores=stage3_out["top_scores_D"],
+        )
+
+        delta = H_p - H_d
+        absolute_delta = torch.abs(delta)
+        product = H_p * H_d
+
+        feature_tokens = torch.stack(
+            [H_u, H_p, H_d, Z_p, Z_d, delta, absolute_delta, product], dim=1
+        )
+        feature_tokens = feature_tokens + self.feature_type_embedding.unsqueeze(0)
+        reasoned_tokens = self.interaction_reasoner(feature_tokens)
+
+        pool_logits = torch.einsum("bkh,h->bk", reasoned_tokens, self.feature_pool_query)
+        pool_weights = torch.softmax(pool_logits, dim=-1)
+        z = torch.sum(pool_weights.unsqueeze(-1) * reasoned_tokens, dim=1)
+
+        if self.use_global_residual:
+            alpha = torch.sigmoid(self.rationale_scale)
+            z = self.global_residual_norm(H_u + alpha * z)
+
+        T_logit = self.verdict_mlp(z).squeeze(-1)
+        T_hat = torch.sigmoid(T_logit)
+
+        return {
+            "T_logit": T_logit,
+            "T_hat": T_hat,
+            "verdict_attention_P": verdict_attention_P,
+            "verdict_attention_D": verdict_attention_D,
+            "feature_attention": pool_weights,
+            "Z_p": Z_p,
+            "Z_d": Z_d,
+            "rationale_scale": torch.sigmoid(self.rationale_scale).detach(),
+        }

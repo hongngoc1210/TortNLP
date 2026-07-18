@@ -9,10 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
-from models.shared_encoder import Stage1Encoder
-from models.re_module      import RationableExtraction
-from models.pooling        import RationalePooling
-from models.td_head        import TDHead
+from models.factory import build_model_stages
 
 
 # =============================================================================
@@ -198,25 +195,7 @@ def load_config(path: str) -> dict:
 def build_models(cfg: dict, device: str):
     """Khởi tạo đúng architecture theo config, chưa load weights."""
 
-    stage1 = Stage1Encoder(
-        model_name          = cfg["model"]["encoder_name"],
-        cross_attn_heads    = cfg["model"].get("cross_attn_heads",    4),
-        cross_attn_dropout  = cfg["model"].get("cross_attn_dropout",  0.1),
-        use_cross_attention = cfg["model"].get("use_cross_attention",  True),
-    ).to(device)
-
-    hidden = stage1.encoder.hidden_size
-
-    stage2 = RationableExtraction(hidden).to(device)
-    stage3 = RationalePooling(hidden).to(device)
-    stage4 = TDHead(
-        hidden         = hidden,
-        num_heads      = cfg["model"].get("td_num_heads",   4),
-        dropout        = cfg["model"].get("td_dropout",     0.2),
-        use_label_attn = cfg["model"].get("use_label_attn", True),
-    ).to(device)
-
-    return stage1, stage2, stage3, stage4
+    return build_model_stages(cfg, device=device)
 
 
 def load_checkpoint(ckpt_path: str, stage1, stage2, stage3, stage4, device: str):

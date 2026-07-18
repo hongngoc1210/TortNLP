@@ -21,19 +21,18 @@ Joint Rationale Extraction and Tort Determination for Japanese civil law cases.
 │   │   ├── conditioning.py           # FiLM conditioner
 │   │   ├── encode_text.py            # Shared ModernBERT encoder
 │   │   ├── re_module.py              # Stage 2: rationale extraction heads
-│   │   ├── pooling.py                # Stage 3: rationale pooling + [A2] contrastive
-│   │   └── td_head.py                # Stage 4: TD head with MoE [A3]
+│   │   ├── pooling.py                # Stage 3: rationale pooling + learned fallback
+│   │   └── td_head.py                # Stage 4: rationale-aligned TP head
 │   ├── losses/
-│   │   ├── multitask_loss.py         # Combined loss [B1–B4]
-│   │   ├── re_loss.py                # Focal Loss for RE [B1]
-│   │   └── td_loss.py                # Asymmetric Loss for TD [B2]
+│   │   ├── multitask_loss.py         # 0.33 L_RE + 0.67 L_TP
+│   │   ├── re_loss.py                # BCE loss for rationale extraction
+│   │   └── td_loss.py                # BCE loss for tort prediction
 │   ├── trainer/
 │   │   ├── engine.py                 # Trainer class (train / eval / predict)
 │   │   ├── metrics.py                # F1, accuracy, optimal threshold search
 │   │   ├── scheduler.py              # Teacher forcing scheduler
 │   │   ├── train_pipeline.py         # Single-GPU build helpers
-│   │   ├── train_pipeline2x.py       # 2-GPU build helpers
-│   │   └── pipeline_utils.py         # Shared utils (gt_stats)
+│   │   └── train_pipeline2x.py       # 2-GPU build helpers
 │   └── data_utils/
 │       ├── __init__.py               # collate_fn, seed_worker
 │       ├── dataset.py                # LegalDataset
@@ -192,30 +191,37 @@ stage4.load_state_dict(ckpt["stage4"])
 Input: U (undisputed facts), P = {p_1…p_M}, D = {d_1…d_N}
 
 Stage 1 — Contextual Claim Encoding
-  ModernBERT-ja-310M  →  CLS pooling  →  H_u, h_P, h_D
-  FiLM conditioning (H_u → γ, β applied to each claim)
-  Claim self-attention  (P attends P, D attends D)      [A1]
-  P↔D cross-attention   (P attends D, D attends P)
+  Shared ModernBERT encoder -> H_u, h_P, h_D
+  Claim-specific fact retrieval + opposing-claim attention + gated fusion
 
-Stage 2 — Rationale Extraction
-  REHead_P: MLP(hidden → hidden/2 → 1) + sigmoid  →  r̂_P
-  REHead_D: MLP(hidden → hidden/2 → 1) + sigmoid  →  r̂_D
-  Loss: Focal Loss (γ=0.5, α=0.75)                      [B1]
+Stage 2 — Rationale Extraction (RE)
+  REHead_P: MLP -> logits/probabilities for plaintiff claims
+  REHead_D: MLP -> logits/probabilities for defendant claims
+  L_RE: BCE for plaintiff claims + BCE for defendant claims
 
-Stage 3 — Robust Rationale Pooling
-  Soft pool: Σ softmax(r̂/τ) · h̃     (rationale-weighted)
-  Fallback:  mean(h̃)                 (when RE uncertain)
-  Mixed:     λ·soft + (1−λ)·mean     (λ = max(r̂))
-  Contrastive loss on claim embeddings                   [A2]
+Stage 3 — Rationale Pooling
+  Rationale-guided attention pooling
+  Learned fallback attention pooling
+  Representation-based mixing gate
+  Top-k claim tokens and rationale scores are passed to Stage 4
+  No handcrafted rationale statistics are produced or consumed
 
-Stage 4 — Tort Determination
-  RE Stats Gate   (confidence-weighted H_re_p / H_re_d)
-  Feature Attention (self-attn over 5 interaction tokens)
-  Mixture of Experts (4 experts, gate conditioned on H_u) [A3]
-  Loss: Asymmetric Loss (γ+=0, γ−=2)                    [B2]
-  + Consistency loss (RE scores must agree with verdict)  [B4]
-  + Uncertainty weighting on λ_RE, λ_TD                  [B3]
+Stage 4 — Tort Prediction (TP)
+  Dual verdict queries
+  Rationale-biased cross-attention over top-k claims
+  Interaction feature construction and transformer reasoning
+  Verdict MLP -> T_logit, T_hat
+  L_TP: BCEWithLogitsLoss
+
+Main objective
+  L_total = 0.33 * L_RE + 0.67 * L_TP
+  No alignment, consistency, uncertainty-weighting, contrastive,
+  teacher-forcing KL, or other auxiliary loss terms are used.
 ```
+
+> **Checkpoint note:** Stage 3 and Stage 4 parameter shapes changed after removing
+> rationale statistics. Retrain from scratch; older checkpoints are not directly
+> compatible with this architecture.
 
 ---
 

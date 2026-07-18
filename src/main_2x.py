@@ -29,7 +29,7 @@ from trainer.train_pipeline2x import (
     build_models,
     build_optimizer_and_scheduler,
 )
-from losses.multitask_loss import MultiTaskLoss
+from losses.factory import build_multitask_loss
 from trainer.engine        import Trainer
 from trainer.scheduler     import TeacherForcingScheduler
 
@@ -190,27 +190,13 @@ def load_checkpoint(
 
 def _empty_history():
     return {
-        "epoch":           [],
-        "train_loss":      [], "train_loss_re": [], "train_loss_td": [],
-        "dev_re_f1_P":     [], "dev_re_f1_D":   [], "dev_re_f1_macro": [],
-        "dev_td_acc":      [], "dev_td_f1":      [],
-        "score":           [],
-        "lr":              [],
+        "epoch": [],
+        "train_loss": [],
+        "dev_re_f1_macro": [],
+        "dev_td_acc": [],
+        "score": [],
+        "lr": [],
     }
-
-
-def _append_history(history, epoch, loss_dict, metrics, lr):
-    history["epoch"].append(epoch)
-    history["train_loss"].append(loss_dict["loss"])
-    history["train_loss_re"].append(loss_dict["loss_re"])
-    history["train_loss_td"].append(loss_dict["loss_td"])
-    history["dev_re_f1_P"].append(metrics["re_f1_P"])
-    history["dev_re_f1_D"].append(metrics["re_f1_D"])
-    history["dev_re_f1_macro"].append(metrics["re_f1_macro"])
-    history["dev_td_acc"].append(metrics["td_acc"])
-    history["dev_td_f1"].append(metrics["td_f1"])
-    history["score"].append(metrics["score"])
-    history["lr"].append(lr)
 
 
 def save_predictions(path, preds):
@@ -248,9 +234,8 @@ def main():
     # ---- models (raw, chưa wrap DDP) ----
     stage1, stage2, stage3, stage4 = build_models(cfg, device)
 
-    # BUG 1 FIX: wrap tất cả 4 stages bằng DDP
-    # find_unused_parameters=True cần thiết vì LabelConditionedAttention
-    # chỉ active khi training + có gt → một số param có thể không có grad
+    # Wrap all four stages with DDP. Keep find_unused_parameters=True because
+    # a batch can occasionally contain no claims for one side.
     ddp_kwargs = dict(
         device_ids=[rank],
         output_device=rank,
@@ -262,7 +247,7 @@ def main():
     stage4 = DDP(stage4, **ddp_kwargs)
 
     # ---- loss ----
-    loss_fn = MultiTaskLoss()
+    loss_fn = build_multitask_loss(cfg)
 
     # ---- optimizer + scheduler ----
     epochs    = cfg["training"]["epochs"]
@@ -301,14 +286,14 @@ def main():
     if args.eval_only:
         if rank == 0:
             load_best_model(cfg, stage1, stage2, stage3, stage4, device)
-            metrics = trainer.evaluate(tqdm(dev_loader, desc="Dev"))
+            re_f1, td_acc = trainer.evaluate(tqdm(dev_loader, desc="Dev"))
             print("\n=== Dev Results ===")
-            for k, v in metrics.items():
-                print(f"  {k}: {v:.4f}")
-            test_metrics = trainer.evaluate(tqdm(test_loader, desc="Test"))
+            print(f"  RE_F1: {re_f1:.4f}")
+            print(f"  TD_ACC: {td_acc:.4f}")
+            test_re_f1, test_td_acc = trainer.evaluate(tqdm(test_loader, desc="Test"))
             print("\n=== Test Results ===")
-            for k, v in test_metrics.items():
-                print(f"  {k}: {v:.4f}")
+            print(f"  RE_F1: {test_re_f1:.4f}")
+            print(f"  TD_ACC: {test_td_acc:.4f}")
         cleanup_ddp()
         return
 
@@ -382,8 +367,7 @@ def main():
         loader = tqdm(train_loader, desc=f"[GPU{rank}] Training") if rank == 0 \
                  else train_loader
 
-        # BUG 4 FIX: train_epoch trả về dict, không phải scalar
-        loss_dict = trainer.train_epoch(loader, epoch)
+        loss_value = trainer.train_epoch(loader, epoch)
 
         # Barrier: đảm bảo tất cả GPU xong train trước khi rank 0 evaluate
         dist.barrier()
@@ -391,24 +375,24 @@ def main():
         # ---- Evaluation chỉ ở rank 0 ----
         if rank == 0:
 
-            # BUG 5 FIX: evaluate() trả về dict
-            metrics    = trainer.evaluate(tqdm(dev_loader, desc="Dev"))
-            score      = metrics["score"]
+            re_f1, td_acc = trainer.evaluate(tqdm(dev_loader, desc="Dev"))
+            score      = (re_f1 + td_acc) / 2.0
             current_lr = optimizer.param_groups[0]["lr"]
 
             print(
                 f"\nEpoch {epoch + 1}/{epochs} | "
-                f"loss={loss_dict['loss']:.4f} "
-                f"re={loss_dict['loss_re']:.4f} "
-                f"td={loss_dict['loss_td']:.4f} | "
-                f"RE_F1_P={metrics['re_f1_P']:.4f} "
-                f"RE_F1_D={metrics['re_f1_D']:.4f} "
-                f"RE_macro={metrics['re_f1_macro']:.4f} | "
-                f"TD_f1={metrics['td_f1']:.4f} "
+                f"loss={loss_value:.4f} | "
+                f"RE_F1={re_f1:.4f} "
+                f"TD_ACC={td_acc:.4f} "
                 f"score={score:.4f}"
             )
 
-            _append_history(history, epoch, loss_dict, metrics, current_lr)
+            history["epoch"].append(epoch)
+            history["train_loss"].append(loss_value)
+            history["dev_re_f1_macro"].append(re_f1)
+            history["dev_td_acc"].append(td_acc)
+            history["score"].append(score)
+            history["lr"].append(current_lr)
 
             # ---- best model checkpoint ----
             if score > best_score:
@@ -467,11 +451,11 @@ def _final_eval_and_predict(cfg, trainer, dev_loader, test_loader, history):
                     trainer.stage3, trainer.stage4, device)
 
     print("\nEvaluating on test set...")
-    test_metrics = trainer.evaluate(tqdm(test_loader, desc="Test"))
+    test_re_f1, test_td_acc = trainer.evaluate(tqdm(test_loader, desc="Test"))
 
     print("\n=== Final Test Results ===")
-    for k, v in test_metrics.items():
-        print(f"  {k}: {v:.4f}")
+    print(f"  RE_F1: {test_re_f1:.4f}")
+    print(f"  TD_ACC: {test_td_acc:.4f}")
 
     log_path = os.path.join(cfg["system"]["save_dir"], "training_log.json")
     with open(log_path, "w") as f:

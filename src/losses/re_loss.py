@@ -1,71 +1,48 @@
-"""
-re_loss.py  —  Focal Loss cho RE (fixed)
+"""Rationale extraction loss."""
 
-Fixes so với version trước:
-  1. alpha=0.25 → alpha=0.75: trong legal RE, positives (R=1) là minority
-     → cần UP-WEIGHT positives, không down-weight. alpha=0.25 là sai hướng
-     (paper RetinaNet dùng 0.25 vì object detection có rất nhiều easy negatives
-      chiếm 99%+; trong legal RE tỉ lệ thường 20-40% positives).
-  2. gamma: giảm từ 2.0 → 1.0 để tránh scale down loss_re quá nhiều so với
-     loss_td, gây mất cân bằng gradient khi kết hợp với uncertainty weighting.
-"""
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-
-class FocalLoss(nn.Module):
-
-    def __init__(self, gamma: float = 1.0, alpha: float = 0.75):
-        """
-        gamma : focusing exponent.
-                1.0 thay vì 2.0 — tránh scale loss_re xuống quá thấp
-                so với loss_td khi dùng uncertainty weighting.
-        alpha : weight cho POSITIVE class.
-                0.75 → positives được weight 3x so với negatives.
-                Tune theo tỉ lệ thực tế:
-                  alpha ≈ N_neg / (N_pos + N_neg)
-                Ví dụ 30% positive → alpha = 0.7
-        """
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-
-    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-
-        bce     = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
-        probs   = torch.sigmoid(logits)
-        p_t     = probs * labels + (1 - probs) * (1 - labels)
-        alpha_t = self.alpha * labels + (1 - self.alpha) * (1 - labels)
-
-        return (alpha_t * (1 - p_t) ** self.gamma * bce).mean()
 
 
 class RELoss(nn.Module):
+    """BCE loss for plaintiff and defendant rationales.
 
-    def __init__(self, gamma: float = 1.0, alpha: float = 0.75):
+    ``side_reduction='mean'`` is recommended.  The old implementation summed
+    the two side losses, making the effective RE contribution roughly twice as
+    large as expected from a nominal 0.33 loss weight.
+    """
+
+    def __init__(self, side_reduction: str = "mean") -> None:
         super().__init__()
-        self.loss_fn = FocalLoss(gamma=gamma, alpha=alpha)
+        if side_reduction not in {"mean", "sum"}:
+            raise ValueError("side_reduction must be 'mean' or 'sum'")
+        self.side_reduction = side_reduction
+        self.loss_fn = nn.BCEWithLogitsLoss()
 
-    def forward(self, outputs: dict, batch: dict) -> torch.Tensor:
+    def _side_loss(self, logits: torch.Tensor, labels: torch.Tensor):
+        if logits.numel() == 0:
+            return None
+        labels = labels.float()
+        mask = labels >= 0
+        if not mask.any():
+            return None
+        return self.loss_fn(logits[mask], labels[mask])
 
-        logits_P = outputs["logits_P"]
-        logits_D = outputs["logits_D"]
-        labels_P = batch["R_P"].float()
-        labels_D = batch["R_D"].float()
+    def forward(self, outputs, batch):
+        side_losses = []
+        loss_p = self._side_loss(outputs["logits_P"], batch["R_P"])
+        loss_d = self._side_loss(outputs["logits_D"], batch["R_D"])
+        if loss_p is not None:
+            side_losses.append(loss_p)
+        if loss_d is not None:
+            side_losses.append(loss_d)
 
-        loss_P = torch.tensor(0.0, device=logits_P.device)
-        loss_D = torch.tensor(0.0, device=logits_D.device)
+        if not side_losses:
+            reference = outputs["logits_P"]
+            return reference.sum() * 0.0
 
-        if logits_P.numel() > 0:
-            mask_P = labels_P >= 0
-            if mask_P.any():
-                loss_P = self.loss_fn(logits_P[mask_P], labels_P[mask_P])
-
-        if logits_D.numel() > 0:
-            mask_D = labels_D >= 0
-            if mask_D.any():
-                loss_D = self.loss_fn(logits_D[mask_D], labels_D[mask_D])
-
-        return torch.nan_to_num(loss_P + loss_D)
+        stacked = torch.stack(side_losses)
+        loss = stacked.mean() if self.side_reduction == "mean" else stacked.sum()
+        return torch.nan_to_num(loss)

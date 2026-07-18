@@ -1,9 +1,3 @@
-"""
-pipeline_utils.py
-Shared utilities dùng chung giữa engine.py và train_pipeline.py.
-Tách ra file riêng để tránh circular import.
-"""
-
 import torch
 
 

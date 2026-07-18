@@ -1,0 +1,113 @@
+experiments:
+  tp_only:
+    ablation:
+      task_mode: tp_only
+      tp_input_mode: global_only
+      train_rationale_source: predicted
+    evaluation:
+      selection_metric: tp
+      compare_rationale_sources: false
+
+  re_only:
+    ablation:
+      task_mode: re_only
+      tp_input_mode: global_only
+      train_rationale_source: predicted
+    evaluation:
+      selection_metric: re
+      compare_rationale_sources: false
+
+  joint_no_rationale:
+    ablation:
+      task_mode: joint
+      tp_input_mode: global_only
+      train_rationale_source: predicted
+    evaluation:
+      selection_metric: mean
+      compare_rationale_sources: false
+
+  joint_predicted:
+    ablation:
+      task_mode: joint
+      tp_input_mode: rationale
+      train_rationale_source: predicted
+      eval_rationale_source: predicted
+    evaluation:
+      selection_metric: mean
+      compare_rationale_sources: true
+
+  joint_teacher_forcing:
+    ablation:
+      task_mode: joint
+      tp_input_mode: rationale
+      train_rationale_source: teacher_forcing
+      eval_rationale_source: predicted
+    evaluation:
+      selection_metric: mean
+      compare_rationale_sources: true
+
+  joint_gold_train:
+    ablation:
+      task_mode: joint
+      tp_input_mode: rationale
+      train_rationale_source: gold
+      eval_rationale_source: predicted
+    evaluation:
+      selection_metric: mean
+      compare_rationale_sources: true
+
+  detach_rationale:
+    ablation:
+      task_mode: joint
+      tp_input_mode: rationale
+      train_rationale_source: predicted
+      detach_rationale_for_tp: true
+    evaluation:
+      selection_metric: mean
+      compare_rationale_sources: true
+
+  task_adapters:
+    ablation:
+      task_mode: joint
+      tp_input_mode: rationale
+      train_rationale_source: predicted
+      use_task_adapters: true
+      adapter_bottleneck: 128
+    evaluation:
+      selection_metric: mean
+      compare_rationale_sources: true
+
+  adapters_global_residual:
+    ablation:
+      task_mode: joint
+      tp_input_mode: rationale
+      train_rationale_source: predicted
+      use_task_adapters: true
+      adapter_bottleneck: 128
+      use_global_residual: true
+      rationale_scale_init: -1.5
+    evaluation:
+      selection_metric: mean
+      compare_rationale_sources: true
+
+  gradient_diagnostics:
+    ablation:
+      task_mode: joint
+      tp_input_mode: rationale
+      train_rationale_source: predicted
+      grad_diagnostics_every: 50
+    evaluation:
+      selection_metric: mean
+      compare_rationale_sources: true
+
+  pcgrad:
+    training:
+      grad_accum_steps: 1
+    ablation:
+      task_mode: joint
+      tp_input_mode: rationale
+      train_rationale_source: predicted
+      gradient_method: pcgrad
+    evaluation:
+      selection_metric: mean
+      compare_rationale_sources: true
