@@ -1,8 +1,5 @@
-"""Training engine with reproducible MTL ablations and diagnostics."""
-
 from __future__ import annotations
 
-import math
 from typing import Iterable
 
 import torch
@@ -42,21 +39,29 @@ class Trainer:
         self.tf_scheduler = tf_scheduler
         self.lr_scheduler = lr_scheduler
 
-        self.device = device
+        self.device = torch.device(device)
+        self.device_type = self.device.type
         self.grad_accum_steps = max(1, int(grad_accum_steps))
         self.max_grad_norm = float(max_grad_norm)
-        self.task_mode = task_mode
-        self.tp_input_mode = tp_input_mode
-        self.train_rationale_source = train_rationale_source
-        self.eval_rationale_source = eval_rationale_source
-        self.gradient_method = gradient_method.lower()
+        self.task_mode = str(task_mode)
+        self.tp_input_mode = str(tp_input_mode)
+        self.train_rationale_source = str(train_rationale_source)
+        self.eval_rationale_source = str(eval_rationale_source)
+        self.gradient_method = str(gradient_method).lower()
         self.grad_diagnostics_every = max(0, int(grad_diagnostics_every))
 
         if self.task_mode not in {"joint", "re_only", "tp_only"}:
             raise ValueError(f"Unknown task_mode={self.task_mode!r}")
         if self.tp_input_mode not in {"rationale", "global_only"}:
             raise ValueError(f"Unknown tp_input_mode={self.tp_input_mode!r}")
-        valid_sources = {"predicted", "teacher_forcing", "gold", "no_rationale", "random"}
+
+        valid_sources = {
+            "predicted",
+            "teacher_forcing",
+            "gold",
+            "no_rationale",
+            "random",
+        }
         if self.train_rationale_source not in valid_sources:
             raise ValueError(
                 f"Unknown train_rationale_source={self.train_rationale_source!r}"
@@ -67,17 +72,76 @@ class Trainer:
             )
         if self.gradient_method not in {"standard", "pcgrad"}:
             raise ValueError("gradient_method must be 'standard' or 'pcgrad'")
+
         if self.gradient_method == "pcgrad":
             if self.task_mode != "joint":
                 raise ValueError("PCGrad is only meaningful in joint task mode")
             if self.grad_accum_steps != 1:
-                raise ValueError("This reference PCGrad implementation requires grad_accum_steps=1")
+                raise ValueError(
+                    "This PCGrad implementation requires grad_accum_steps=1"
+                )
             use_amp = False
 
-        self.use_amp = bool(use_amp and "cuda" in str(device))
+        self.use_amp = bool(
+            use_amp
+            and self.device_type == "cuda"
+            and torch.cuda.is_available()
+        )
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+
         self.last_train_stats = {}
         self.last_eval = {}
+
+        self._validate_active_parameters()
+
+    # ------------------------------------------------------------------
+    # Configuration and validation
+    # ------------------------------------------------------------------
+
+    def _active_training_modules(self):
+        if self.task_mode == "re_only":
+            return [self.stage1, self.stage2]
+
+        if self.task_mode == "tp_only":
+            if self.tp_input_mode == "global_only":
+                return [self.stage1, self.stage4]
+            return [self.stage1, self.stage2, self.stage3, self.stage4]
+
+        return [self.stage1, self.stage2, self.stage3, self.stage4]
+
+    def _validate_active_parameters(self):
+        active_parameters = self._trainable_parameters(
+            self._active_training_modules()
+        )
+        if not active_parameters:
+            raise RuntimeError(
+                f"No trainable parameters for task_mode={self.task_mode!r}. "
+                "Check requires_grad before constructing the optimizer."
+            )
+
+        optimizer_parameter_ids = {
+            id(parameter)
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        missing_from_optimizer = [
+            parameter
+            for parameter in active_parameters
+            if id(parameter) not in optimizer_parameter_ids
+        ]
+        if missing_from_optimizer:
+            missing_count = sum(
+                parameter.numel() for parameter in missing_from_optimizer
+            )
+            raise RuntimeError(
+                "Some active trainable parameters are missing from the optimizer "
+                f"({missing_count:,} parameters). Configure requires_grad before "
+                "building the optimizer."
+            )
+
+    # ------------------------------------------------------------------
+    # Rationale controls
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _mix_rationale_scores(
@@ -112,30 +176,63 @@ class Trainer:
         shuffled = scores.detach().clone()
         if scores.numel() == 0:
             return shuffled
+
         for case_id in sample_map.unique(sorted=False):
-            idx = torch.nonzero(sample_map == case_id, as_tuple=True)[0]
-            if idx.numel() > 1:
-                permutation = idx[torch.randperm(idx.numel(), device=idx.device)]
-                shuffled[idx] = scores.detach()[permutation]
+            indices = torch.nonzero(sample_map == case_id, as_tuple=True)[0]
+            if indices.numel() > 1:
+                permutation = indices[
+                    torch.randperm(indices.numel(), device=indices.device)
+                ]
+                shuffled[indices] = scores.detach()[permutation]
         return shuffled
+
+    # ------------------------------------------------------------------
+    # Batch and mode utilities
+    # ------------------------------------------------------------------
 
     def _move_batch(self, batch):
         return {
-            key: value.to(self.device) if torch.is_tensor(value) else value
+            key: (
+                value.to(self.device, non_blocking=True)
+                if torch.is_tensor(value)
+                else value
+            )
             for key, value in batch.items()
         }
 
     def _set_train_mode(self):
-        self.stage1.train()
-        self.stage2.train()
-        self.stage3.train()
-        self.stage4.train()
+        self.stage1.eval()
+        self.stage2.eval()
+        self.stage3.eval()
+        self.stage4.eval()
+        for module in self._active_training_modules():
+            module.train()
 
     def _set_eval_mode(self):
         self.stage1.eval()
         self.stage2.eval()
         self.stage3.eval()
         self.stage4.eval()
+
+    @staticmethod
+    def _count_valid_labels(labels) -> int:
+        if labels is None or not torch.is_tensor(labels) or labels.numel() == 0:
+            return 0
+        valid = torch.isfinite(labels) & (labels >= 0)
+        return int(valid.sum().item())
+
+    def _has_re_supervision(self, batch: dict) -> bool:
+        return (
+            self._count_valid_labels(batch.get("R_P")) > 0
+            or self._count_valid_labels(batch.get("R_D")) > 0
+        )
+
+    def _has_tp_supervision(self, batch: dict) -> bool:
+        return self._count_valid_labels(batch.get("T")) > 0
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def _prepare_pooling_inputs(
         self,
@@ -181,8 +278,12 @@ class Trainer:
         epoch: int = 0,
         rationale_source: str | None = None,
     ):
-        s1 = self.stage1(batch)
+        if self.task_mode == "tp_only" and self.tp_input_mode == "global_only":
+            s1 = self.stage1.forward_global(batch)
+            s4 = self.stage4(s1, None, input_mode="global_only")
+            return s1, None, None, s4
 
+        s1 = self.stage1(batch)
         need_re = self.task_mode != "tp_only" or self.tp_input_mode == "rationale"
         s2 = self.stage2(s1) if need_re else None
 
@@ -198,7 +299,11 @@ class Trainer:
 
         source = rationale_source
         if source is None:
-            source = self.train_rationale_source if self.stage1.training else self.eval_rationale_source
+            source = (
+                self.train_rationale_source
+                if self.stage1.training
+                else self.eval_rationale_source
+            )
 
         eta = 0.0
         if self.tf_scheduler is not None:
@@ -214,6 +319,161 @@ class Trainer:
         s4 = self.stage4(s1, s3, input_mode="rationale")
         return s1, s2, s3, s4
 
+    # ------------------------------------------------------------------
+    # Objective handling
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _as_scalar_tensor(value, reference=None):
+        if torch.is_tensor(value):
+            return value
+        if reference is not None and torch.is_tensor(reference):
+            return reference.new_tensor(float(value))
+        return torch.tensor(float(value))
+
+    @staticmethod
+    def _first_graph_connected(*candidates):
+        for candidate in candidates:
+            if torch.is_tensor(candidate) and candidate.requires_grad:
+                return candidate
+        return None
+
+    def _compute_task_losses(self, s2, s4, batch):
+        """Compute only the objective required by the active ablation.
+
+        Important:
+        ``MultiTaskLoss.task_objectives`` assumes that both RE and TP outputs
+        exist. Therefore it must not be called in ``re_only`` or ``tp_only``
+        mode, where one output is intentionally ``None``.
+        """
+
+        if self.task_mode == "re_only":
+            if s2 is None:
+                raise RuntimeError(
+                    "re_only requires Stage 2 outputs, but s2 is None."
+                )
+
+            # Prefer the dedicated RE criterion so the loss is not multiplied
+            # by the joint-task weight (0.33).
+            if hasattr(self.loss_fn, "re_loss"):
+                loss_re = self.loss_fn.re_loss(s2, batch)
+                loss = loss_re
+                loss_tp = loss_re.detach().new_zeros(())
+            else:
+                loss, loss_re, loss_tp = self.loss_fn(
+                    s2,
+                    None,
+                    batch,
+                )
+
+        elif self.task_mode == "tp_only":
+            if s4 is None:
+                raise RuntimeError(
+                    "tp_only requires Stage 4 outputs, but s4 is None."
+                )
+
+            # Prefer the dedicated TP criterion so the loss is not multiplied
+            # by the joint-task weight (0.67).
+            if hasattr(self.loss_fn, "tp_loss"):
+                loss_tp = self.loss_fn.tp_loss(s4, batch)
+                loss = loss_tp
+                loss_re = loss_tp.detach().new_zeros(())
+            else:
+                loss, loss_re, loss_tp = self.loss_fn(
+                    None,
+                    s4,
+                    batch,
+                )
+
+        else:
+            if s2 is None or s4 is None:
+                raise RuntimeError(
+                    "joint mode requires both Stage 2 and Stage 4 outputs."
+                )
+
+            loss, loss_re, loss_tp = self.loss_fn(
+                s2,
+                s4,
+                batch,
+            )
+
+        if not torch.is_tensor(loss):
+            raise TypeError(
+                "The active training loss must be a torch.Tensor, "
+                f"but received {type(loss).__name__}."
+            )
+
+        if loss.ndim != 0:
+            loss = loss.mean()
+
+        if not loss.requires_grad:
+            self._raise_detached_loss_error(
+                s2=s2,
+                s4=s4,
+                batch=batch,
+                total_loss=loss,
+                re_objective=(
+                    loss_re if self.task_mode != "tp_only" else None
+                ),
+                tp_objective=(
+                    loss_tp if self.task_mode != "re_only" else None
+                ),
+                loss_re=loss_re,
+                loss_tp=loss_tp,
+            )
+
+        return loss, loss_re, loss_tp
+
+    def _raise_detached_loss_error(
+        self,
+        *,
+        s2,
+        s4,
+        batch,
+        total_loss,
+        re_objective,
+        tp_objective,
+        loss_re,
+        loss_tp,
+    ):
+        def grad_state(value):
+            if value is None:
+                return "None"
+            if not torch.is_tensor(value):
+                return type(value).__name__
+            grad_fn_name = type(value.grad_fn).__name__ if value.grad_fn else None
+            scalar = float(value.detach().float().item())
+            return (
+                f"requires_grad={value.requires_grad}, "
+                f"grad_fn={grad_fn_name}, value={scalar:.6f}"
+            )
+
+        logits_p = s2.get("logits_P") if isinstance(s2, dict) else None
+        logits_d = s2.get("logits_D") if isinstance(s2, dict) else None
+        t_hat = s4.get("T_hat") if isinstance(s4, dict) else None
+
+        raise RuntimeError(
+            "No graph-connected training objective was found.\n"
+            f"task_mode={self.task_mode}\n"
+            f"torch.is_grad_enabled()={torch.is_grad_enabled()}\n"
+            f"valid_R_P={self._count_valid_labels(batch.get('R_P'))}\n"
+            f"valid_R_D={self._count_valid_labels(batch.get('R_D'))}\n"
+            f"valid_T={self._count_valid_labels(batch.get('T'))}\n"
+            f"total_loss: {grad_state(total_loss)}\n"
+            f"re_objective: {grad_state(re_objective)}\n"
+            f"tp_objective: {grad_state(tp_objective)}\n"
+            f"loss_re: {grad_state(loss_re)}\n"
+            f"loss_tp: {grad_state(loss_tp)}\n"
+            f"logits_P: {grad_state(logits_p)}\n"
+            f"logits_D: {grad_state(logits_d)}\n"
+            f"T_hat: {grad_state(t_hat)}\n"
+            "Check the loss implementation and requires_grad configuration."
+        )
+
+    # ------------------------------------------------------------------
+    # Gradient utilities
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _trainable_parameters(modules: Iterable[torch.nn.Module]):
         return [
@@ -228,6 +488,7 @@ class Trainer:
         dot = None
         norm_a = None
         norm_b = None
+
         for grad_a, grad_b in zip(grads_a, grads_b):
             if grad_a is None or grad_b is None:
                 continue
@@ -247,9 +508,22 @@ class Trainer:
             device = device or torch.device("cpu")
             zero = torch.tensor(0.0, device=device)
             return zero, zero, zero
+
         return dot, norm_a, norm_b
 
     def _gradient_diagnostics(self, re_objective, tp_objective):
+        if (
+            not torch.is_tensor(re_objective)
+            or not re_objective.requires_grad
+            or not torch.is_tensor(tp_objective)
+            or not tp_objective.requires_grad
+        ):
+            return {
+                "grad_re_norm": 0.0,
+                "grad_tp_norm": 0.0,
+                "grad_cosine": 0.0,
+            }
+
         shared_params = self._trainable_parameters([self.stage1])
         re_grads = torch.autograd.grad(
             re_objective,
@@ -274,9 +548,12 @@ class Trainer:
         }
 
     def _pcgrad_backward(self, re_objective, tp_objective):
-        """Symmetric two-task PCGrad on Stage 1 shared parameters."""
-        # Stage 2 is also shared in rationale mode because TP consumes its
-        # probabilities. In global-only mode its TP gradients are simply None.
+        """Symmetric two-task PCGrad on Stage 1/2 shared parameters."""
+        if not re_objective.requires_grad or not tp_objective.requires_grad:
+            raise RuntimeError(
+                "PCGrad requires graph-connected RE and TP objectives."
+            )
+
         shared_params = self._trainable_parameters([self.stage1, self.stage2])
         re_specific = []
         tp_specific = self._trainable_parameters([self.stage3, self.stage4])
@@ -300,13 +577,20 @@ class Trainer:
         n_shared = len(shared_params)
         re_shared = re_grads_all[:n_shared]
         tp_shared = tp_grads_all[:n_shared]
-        dot, norm_re_sq, norm_tp_sq = self._dot_and_norms(re_shared, tp_shared)
+        dot, norm_re_sq, norm_tp_sq = self._dot_and_norms(
+            re_shared,
+            tp_shared,
+        )
 
         conflict = bool(dot.detach().item() < 0.0)
         coefficient_re = dot / (norm_tp_sq + 1e-12)
         coefficient_tp = dot / (norm_re_sq + 1e-12)
 
-        for parameter, grad_re, grad_tp in zip(shared_params, re_shared, tp_shared):
+        for parameter, grad_re, grad_tp in zip(
+            shared_params,
+            re_shared,
+            tp_shared,
+        ):
             if grad_re is None and grad_tp is None:
                 parameter.grad = None
                 continue
@@ -340,6 +624,32 @@ class Trainer:
             "pcgrad_conflict": float(conflict),
         }
 
+    def _parameters_with_grad(self):
+        return [
+            parameter
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+            if parameter.grad is not None
+        ]
+
+    def _optimizer_step(self):
+        self.scaler.unscale_(self.optimizer)
+        parameters = self._parameters_with_grad()
+        if parameters:
+            torch.nn.utils.clip_grad_norm_(
+                parameters,
+                self.max_grad_norm,
+            )
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+        self.optimizer.zero_grad(set_to_none=True)
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
     def train_epoch(self, loader, epoch):
         self._set_train_mode()
 
@@ -348,6 +658,8 @@ class Trainer:
             "loss_re": 0.0,
             "loss_tp": 0.0,
             "steps": 0,
+            "skipped_steps": 0,
+            "optimizer_steps": 0,
             "grad_re_norm": 0.0,
             "grad_tp_norm": 0.0,
             "grad_cosine": 0.0,
@@ -356,79 +668,113 @@ class Trainer:
         }
 
         self.optimizer.zero_grad(set_to_none=True)
+        accumulated_micro_steps = 0
 
-        for step, batch in enumerate(loader):
-            batch = self._move_batch(batch)
+        with torch.enable_grad():
+            for step, batch in enumerate(loader):
+                batch = self._move_batch(batch)
 
-            if self.gradient_method == "pcgrad":
-                self.optimizer.zero_grad(set_to_none=True)
-                s1, s2, s3, s4 = self._forward_batch(batch, epoch=epoch)
-                re_obj, tp_obj, loss_re, loss_tp = self.loss_fn.task_objectives(
-                    s2, s4, batch
-                )
-                diag = self._pcgrad_backward(re_obj, tp_obj)
+                if step % 50 == 0:
+                    num_u = batch["U_input_ids"].size(0)
+                    num_p = batch["P_input_ids"].size(0)
+                    num_d = batch["D_input_ids"].size(0)
+                    tokens_u = int(batch["U_attention_mask"].sum().item())
+                    tokens_p = int(batch["P_attention_mask"].sum().item())
+                    tokens_d = int(batch["D_attention_mask"].sum().item())
+                    print(
+                        f"[Epoch {epoch} | Step {step}/{len(loader)}] "
+                        f"cases={num_u} | P={num_p} | D={num_d} | "
+                        f"tokens U/P/D={tokens_u}/{tokens_p}/{tokens_d}",
+                        flush=True,
+                    )
 
-                torch.nn.utils.clip_grad_norm_(
-                    [
-                        parameter
-                        for group in self.optimizer.param_groups
-                        for parameter in group["params"]
-                        if parameter.grad is not None
-                    ],
-                    self.max_grad_norm,
-                )
-                self.optimizer.step()
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.step()
+                if self.task_mode == "re_only" and not self._has_re_supervision(batch):
+                    totals["skipped_steps"] += 1
+                    continue
+                if self.task_mode == "tp_only" and not self._has_tp_supervision(batch):
+                    totals["skipped_steps"] += 1
+                    continue
 
-                loss = re_obj + tp_obj
-                for key, value in diag.items():
-                    totals[key] += value
-                totals["grad_samples"] += 1
-            else:
-                with torch.amp.autocast("cuda", enabled=self.use_amp):
-                    s1, s2, s3, s4 = self._forward_batch(batch, epoch=epoch)
-                    loss, loss_re, loss_tp = self.loss_fn(s2, s4, batch)
-                    scaled_loss = loss / self.grad_accum_steps
+                if self.gradient_method == "pcgrad":
+                    self.optimizer.zero_grad(set_to_none=True)
+                    with torch.amp.autocast(self.device_type, enabled=False):
+                        s1, s2, s3, s4 = self._forward_batch(
+                            batch,
+                            epoch=epoch,
+                        )
+                        re_objective, tp_objective, loss_re, loss_tp = (
+                            self.loss_fn.task_objectives(s2, s4, batch)
+                        )
+                    diag = self._pcgrad_backward(re_objective, tp_objective)
 
-                if (
-                    self.task_mode == "joint"
-                    and self.grad_diagnostics_every > 0
-                    and step % self.grad_diagnostics_every == 0
-                ):
-                    re_obj, tp_obj, _, _ = self.loss_fn.task_objectives(s2, s4, batch)
-                    diag = self._gradient_diagnostics(re_obj, tp_obj)
+                    parameters = self._parameters_with_grad()
+                    if parameters:
+                        torch.nn.utils.clip_grad_norm_(
+                            parameters,
+                            self.max_grad_norm,
+                        )
+                    self.optimizer.step()
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
+
+                    loss = re_objective + tp_objective
+                    totals["optimizer_steps"] += 1
                     for key, value in diag.items():
                         totals[key] += value
                     totals["grad_samples"] += 1
 
-                self.scaler.scale(scaled_loss).backward()
+                else:
+                    with torch.amp.autocast(
+                        self.device_type,
+                        enabled=self.use_amp,
+                    ):
+                        s1, s2, s3, s4 = self._forward_batch(
+                            batch,
+                            epoch=epoch,
+                        )
+                        loss, loss_re, loss_tp = self._compute_task_losses(
+                            s2,
+                            s4,
+                            batch,
+                        )
+                        scaled_loss = loss / self.grad_accum_steps
 
-                should_step = (
-                    (step + 1) % self.grad_accum_steps == 0
-                    or (step + 1) == len(loader)
-                )
-                if should_step:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        [
-                            parameter
-                            for group in self.optimizer.param_groups
-                            for parameter in group["params"]
-                            if parameter.grad is not None
-                        ],
-                        self.max_grad_norm,
-                    )
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    if self.lr_scheduler is not None:
-                        self.lr_scheduler.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+                    if (
+                        self.task_mode == "joint"
+                        and self.grad_diagnostics_every > 0
+                        and step % self.grad_diagnostics_every == 0
+                    ):
+                        re_objective, tp_objective, _, _ = (
+                            self.loss_fn.task_objectives(s2, s4, batch)
+                        )
+                        diag = self._gradient_diagnostics(
+                            re_objective,
+                            tp_objective,
+                        )
+                        for key, value in diag.items():
+                            totals[key] += value
+                        totals["grad_samples"] += 1
 
-            totals["loss"] += float(loss.detach().item())
-            totals["loss_re"] += float(loss_re.detach().item())
-            totals["loss_tp"] += float(loss_tp.detach().item())
-            totals["steps"] += 1
+                    self.scaler.scale(scaled_loss).backward()
+                    accumulated_micro_steps += 1
+
+                    if accumulated_micro_steps >= self.grad_accum_steps:
+                        self._optimizer_step()
+                        totals["optimizer_steps"] += 1
+                        accumulated_micro_steps = 0
+
+                totals["loss"] += float(loss.detach().float().item())
+                totals["loss_re"] += float(loss_re.detach().float().item())
+                totals["loss_tp"] += float(loss_tp.detach().float().item())
+                totals["steps"] += 1
+
+        if self.gradient_method == "standard" and accumulated_micro_steps > 0:
+            correction = self.grad_accum_steps / accumulated_micro_steps
+            if correction != 1.0:
+                for parameter in self._parameters_with_grad():
+                    parameter.grad.mul_(correction)
+            self._optimizer_step()
+            totals["optimizer_steps"] += 1
 
         steps = max(1, totals["steps"])
         grad_samples = max(1, totals["grad_samples"])
@@ -436,12 +782,21 @@ class Trainer:
             "loss": totals["loss"] / steps,
             "loss_re": totals["loss_re"] / steps,
             "loss_tp": totals["loss_tp"] / steps,
+            "processed_steps": totals["steps"],
+            "skipped_steps": totals["skipped_steps"],
+            "optimizer_steps": totals["optimizer_steps"],
             "grad_re_norm": totals["grad_re_norm"] / grad_samples,
             "grad_tp_norm": totals["grad_tp_norm"] / grad_samples,
             "grad_cosine": totals["grad_cosine"] / grad_samples,
-            "pcgrad_conflict_rate": totals["pcgrad_conflict"] / grad_samples,
+            "pcgrad_conflict_rate": (
+                totals["pcgrad_conflict"] / grad_samples
+            ),
         }
         return self.last_train_stats["loss"]
+
+    # ------------------------------------------------------------------
+    # Evaluation and prediction
+    # ------------------------------------------------------------------
 
     def evaluate(self, loader, rationale_source=None, return_dict=False):
         self._set_eval_mode()
@@ -453,10 +808,13 @@ class Trainer:
 
         source = rationale_source or self.eval_rationale_source
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in loader:
                 batch = self._move_batch(batch)
-                with torch.amp.autocast("cuda", enabled=self.use_amp):
+                with torch.amp.autocast(
+                    self.device_type,
+                    enabled=self.use_amp,
+                ):
                     s1, s2, s3, s4 = self._forward_batch(
                         batch,
                         epoch=0,
@@ -464,34 +822,54 @@ class Trainer:
                     )
 
                 if s2 is not None:
-                    re_preds_p.append(s2["rP_hat"])
-                    re_labels_p.append(batch["R_P"])
-                    re_preds_d.append(s2["rD_hat"])
-                    re_labels_d.append(batch["R_D"])
+                    re_preds_p.append(s2["rP_hat"].detach().cpu())
+                    re_labels_p.append(batch["R_P"].detach().cpu())
+                    re_preds_d.append(s2["rD_hat"].detach().cpu())
+                    re_labels_d.append(batch["R_D"].detach().cpu())
                 if s4 is not None:
-                    td_preds.append(s4["T_hat"])
-                    td_labels.append(batch["T"])
+                    td_preds.append(s4["T_hat"].detach().cpu())
+                    td_labels.append(batch["T"].detach().cpu())
                 if s3 is not None:
-                    gate_p.append(s3["mix_gate_P"].reshape(-1))
-                    gate_d.append(s3["mix_gate_D"].reshape(-1))
+                    gate_p.append(s3["mix_gate_P"].reshape(-1).detach().cpu())
+                    gate_d.append(s3["mix_gate_D"].reshape(-1).detach().cpu())
 
         def cat_or_empty(items):
             return torch.cat(items) if items else torch.empty(0)
 
-        p_pred, p_label = cat_or_empty(re_preds_p), cat_or_empty(re_labels_p)
-        d_pred, d_label = cat_or_empty(re_preds_d), cat_or_empty(re_labels_d)
-        t_pred, t_label = cat_or_empty(td_preds), cat_or_empty(td_labels)
+        p_pred = cat_or_empty(re_preds_p)
+        p_label = cat_or_empty(re_labels_p)
+        d_pred = cat_or_empty(re_preds_d)
+        d_label = cat_or_empty(re_labels_d)
+        t_pred = cat_or_empty(td_preds)
+        t_label = cat_or_empty(td_labels)
 
-        re_p_f1 = compute_re_f1(p_pred, p_label) if p_pred.numel() else float("nan")
-        re_d_f1 = compute_re_f1(d_pred, d_label) if d_pred.numel() else float("nan")
+        re_p_f1 = (
+            compute_re_f1(p_pred, p_label)
+            if p_pred.numel()
+            else float("nan")
+        )
+        re_d_f1 = (
+            compute_re_f1(d_pred, d_label)
+            if d_pred.numel()
+            else float("nan")
+        )
         if p_pred.numel() or d_pred.numel():
             re_f1 = compute_re_f1(
-                torch.cat([x for x in [p_pred, d_pred] if x.numel()]),
-                torch.cat([x for x in [p_label, d_label] if x.numel()]),
+                torch.cat(
+                    [value for value in (p_pred, d_pred) if value.numel()]
+                ),
+                torch.cat(
+                    [value for value in (p_label, d_label) if value.numel()]
+                ),
             )
         else:
             re_f1 = float("nan")
-        tp_acc = compute_td_accuracy(t_pred, t_label) if t_pred.numel() else float("nan")
+
+        tp_acc = (
+            compute_td_accuracy(t_pred, t_label)
+            if t_pred.numel()
+            else float("nan")
+        )
 
         gp = cat_or_empty(gate_p)
         gd = cat_or_empty(gate_d)
@@ -503,8 +881,16 @@ class Trainer:
             "rationale_source": source,
             "gate_p_mean": float(gp.mean().item()) if gp.numel() else float("nan"),
             "gate_d_mean": float(gd.mean().item()) if gd.numel() else float("nan"),
-            "gate_p_saturation": float(((gp < 0.1) | (gp > 0.9)).float().mean().item()) if gp.numel() else float("nan"),
-            "gate_d_saturation": float(((gd < 0.1) | (gd > 0.9)).float().mean().item()) if gd.numel() else float("nan"),
+            "gate_p_saturation": (
+                float(((gp < 0.1) | (gp > 0.9)).float().mean().item())
+                if gp.numel()
+                else float("nan")
+            ),
+            "gate_d_saturation": (
+                float(((gd < 0.1) | (gd > 0.9)).float().mean().item())
+                if gd.numel()
+                else float("nan")
+            ),
         }
 
         if return_dict:
@@ -516,20 +902,30 @@ class Trainer:
         source = rationale_source or self.eval_rationale_source
         predictions = []
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in loader:
                 batch = self._move_batch(batch)
-                _, s2, _, s4 = self._forward_batch(
-                    batch,
-                    epoch=0,
-                    rationale_source=source,
-                )
+                with torch.amp.autocast(
+                    self.device_type,
+                    enabled=self.use_amp,
+                ):
+                    _, _, _, s4 = self._forward_batch(
+                        batch,
+                        epoch=0,
+                        rationale_source=source,
+                    )
+
                 if s4 is None:
                     continue
-                T = s4["T_hat"].cpu()
+
+                t_predictions = s4["T_hat"].detach().cpu()
                 tort_ids = batch["tort_id"]
                 for index, tort_id in enumerate(tort_ids):
                     predictions.append(
-                        {"tort_id": tort_id, "T_hat": float(T[index])}
+                        {
+                            "tort_id": tort_id,
+                            "T_hat": float(t_predictions[index]),
+                        }
                     )
+
         return predictions
