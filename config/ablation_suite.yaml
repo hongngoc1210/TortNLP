@@ -9,6 +9,13 @@ experiments:
       compare_rationale_sources: false
 
   re_only:
+    # Safe profile for a 16 GB Kaggle GPU. Effective batch size remains 64:
+    # 1 case/forward x 64 accumulated forwards.
+    training:
+      batch_size: 1
+      grad_accum_steps: 64
+    model:
+      claim_chunk_size: 8
     ablation:
       task_mode: re_only
       tp_input_mode: global_only
@@ -108,6 +115,29 @@ experiments:
       tp_input_mode: rationale
       train_rationale_source: predicted
       gradient_method: pcgrad
+    evaluation:
+      selection_metric: mean
+      compare_rationale_sources: true
+
+  final_v2_single_phase:
+    training:
+      batch_size: 1
+      grad_accum_steps: 64
+    model:
+      claim_chunk_size: 4
+    ablation:
+      task_mode: joint
+      tp_input_mode: rationale
+      train_rationale_source: predicted
+      eval_rationale_source: predicted
+      use_task_adapters: true
+      adapter_bottleneck: 128
+      adapter_dropout: 0.1
+      detach_rationale_for_tp: true
+      use_global_residual: true
+      mix_gate_init: -1.5
+      rationale_scale_init: -1.5
+      gradient_method: standard
     evaluation:
       selection_metric: mean
       compare_rationale_sources: true

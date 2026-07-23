@@ -238,3 +238,17 @@ If you use this code, please cite:
   year      = {2026}
 }
 ```
+---
+
+## Final V2 (recommended)
+
+The default `src/main.py` now runs the two-phase detached-rationale residual
+architecture. See [`FINAL_V2_GUIDE.md`](FINAL_V2_GUIDE.md).
+
+```bash
+python src/main.py \
+  --config config/final_v2.yaml \
+  --phase1-checkpoint outputs/ablations/joint_no_rationale/best_model.pt
+```
+
+The previous single-phase entry point is retained as `src/main_legacy.py`.

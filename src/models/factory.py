@@ -30,7 +30,7 @@ def build_model_stages(cfg: dict, device: Optional[str] = None):
     )
 
     hidden = stage1.encoder.hidden_size
-    use_task_adapters = bool(ablation_cfg.get("use_task_adapters", False))
+    use_task_adapters = bool(ablation_cfg.get("use_task_adapters", True))
     adapter_bottleneck = int(ablation_cfg.get("adapter_bottleneck", 128))
     adapter_dropout = float(ablation_cfg.get("adapter_dropout", 0.1))
 
@@ -50,7 +50,10 @@ def build_model_stages(cfg: dict, device: Optional[str] = None):
         adapter_bottleneck=adapter_bottleneck,
         adapter_dropout=adapter_dropout,
         detach_rationale_for_tp=bool(
-            ablation_cfg.get("detach_rationale_for_tp", False)
+            ablation_cfg.get("detach_rationale_for_tp", True)
+        ),
+        mix_gate_init=float(
+            ablation_cfg.get("mix_gate_init", -1.5)
         ),
     )
 
@@ -60,7 +63,7 @@ def build_model_stages(cfg: dict, device: Optional[str] = None):
         dropout=model_cfg.get("td_dropout", 0.2),
         input_mode=ablation_cfg.get("tp_input_mode", "rationale"),
         use_global_residual=bool(
-            ablation_cfg.get("use_global_residual", False)
+            ablation_cfg.get("use_global_residual", True)
         ),
         rationale_scale_init=float(
             ablation_cfg.get("rationale_scale_init", -1.5)

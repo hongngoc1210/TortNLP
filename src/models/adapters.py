@@ -1,4 +1,9 @@
-"""Small task-specific residual adapters for MTL ablations."""
+"""Exact-identity task adapters for the final MTL architecture.
+
+The adapter is initialized as an exact identity mapping.  This matters when a
+phase-1 checkpoint trained without adapters is loaded into the phase-2 model:
+adding the adapter must not immediately change the RE representations.
+"""
 
 from __future__ import annotations
 
@@ -12,10 +17,10 @@ class IdentityAdapter(nn.Module):
 
 
 class TaskAdapter(nn.Module):
-    """A light bottleneck adapter with a residual connection.
+    """Small bottleneck residual adapter.
 
-    It gives RE and TP a small amount of task-specific capacity while keeping
-    the expensive Transformer encoder shared.
+    ``up`` is zero-initialized, therefore the initial forward pass is exactly
+    ``hidden_states`` rather than merely approximately identical.
     """
 
     def __init__(
@@ -25,21 +30,30 @@ class TaskAdapter(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        bottleneck_size = max(1, min(int(bottleneck_size), int(hidden_size)))
+
+        hidden_size = int(hidden_size)
+        bottleneck_size = max(
+            1,
+            min(int(bottleneck_size), hidden_size),
+        )
+
+        self.pre_norm = nn.LayerNorm(hidden_size)
         self.down = nn.Linear(hidden_size, bottleneck_size)
         self.activation = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(float(dropout))
         self.up = nn.Linear(bottleneck_size, hidden_size)
-        self.norm = nn.LayerNorm(hidden_size)
 
-        # Start close to identity so that adding adapters does not immediately
-        # destroy the pretrained/shared representation.
+        # Exact identity at initialization.
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        update = self.up(self.dropout(self.activation(self.down(hidden_states))))
-        return self.norm(hidden_states + update)
+        update = self.pre_norm(hidden_states)
+        update = self.down(update)
+        update = self.activation(update)
+        update = self.dropout(update)
+        update = self.up(update)
+        return hidden_states + update
 
 
 def build_adapter(
@@ -50,6 +64,7 @@ def build_adapter(
 ) -> nn.Module:
     if not enabled:
         return IdentityAdapter()
+
     return TaskAdapter(
         hidden_size=hidden_size,
         bottleneck_size=bottleneck_size,

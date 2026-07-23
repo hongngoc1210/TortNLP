@@ -117,3 +117,18 @@ majority
 → gradient diagnostics
 → PCGrad only when diagnostics support it
 ```
+
+## Memory-safe RE-only run on a 16 GB GPU
+
+The `re_only` experiment overrides the base config with `batch_size: 1`,
+`grad_accum_steps: 64`, and `claim_chunk_size: 8`.  This preserves the original
+effective batch size of 64 cases while lowering peak memory.  Stage 1 also uses
+a case-wise fact retrieval implementation that does not duplicate the full fact
+sequence for every claim.
+
+Run:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python src/ablation_main.py --experiment re_only
+```

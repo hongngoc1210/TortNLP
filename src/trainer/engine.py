@@ -1,3 +1,15 @@
+"""Training engine with reproducible MTL ablations and diagnostics.
+
+Key fixes:
+- Select the active task objective explicitly for re_only / tp_only / joint.
+- Prefer graph-connected task objectives returned by loss_fn.task_objectives().
+- Skip RE-only micro-batches that contain no valid RE supervision.
+- Run training under torch.enable_grad() and emit actionable diagnostics if a
+  loss is unexpectedly detached.
+- Accumulate gradients by processed micro-batches rather than DataLoader index.
+- Keep inactive stages in eval mode during single-task ablations.
+"""
+
 from __future__ import annotations
 
 from typing import Iterable
@@ -201,12 +213,19 @@ class Trainer:
         }
 
     def _set_train_mode(self):
+        # Frozen modules stay in eval mode, which disables dropout and keeps the
+        # phase-1 RE/global anchor stable during the phase-2 head warm-up.
         self.stage1.eval()
         self.stage2.eval()
         self.stage3.eval()
         self.stage4.eval()
+
         for module in self._active_training_modules():
-            module.train()
+            if any(
+                parameter.requires_grad
+                for parameter in module.parameters()
+            ):
+                module.train()
 
     def _set_eval_mode(self):
         self.stage1.eval()
@@ -805,6 +824,9 @@ class Trainer:
         re_preds_d, re_labels_d = [], []
         td_preds, td_labels = [], []
         gate_p, gate_d = [], []
+        rationale_scales = []
+        global_logits = []
+        rationale_deltas = []
 
         source = rationale_source or self.eval_rationale_source
 
@@ -829,6 +851,17 @@ class Trainer:
                 if s4 is not None:
                     td_preds.append(s4["T_hat"].detach().cpu())
                     td_labels.append(batch["T"].detach().cpu())
+                    if "rationale_scale" in s4:
+                        scale = s4["rationale_scale"].detach().float().reshape(-1)
+                        rationale_scales.append(scale.cpu())
+                    if "global_T_logit" in s4:
+                        global_logits.append(
+                            s4["global_T_logit"].detach().float().reshape(-1).cpu()
+                        )
+                    if "rationale_delta_logit" in s4:
+                        rationale_deltas.append(
+                            s4["rationale_delta_logit"].detach().float().reshape(-1).cpu()
+                        )
                 if s3 is not None:
                     gate_p.append(s3["mix_gate_P"].reshape(-1).detach().cpu())
                     gate_d.append(s3["mix_gate_D"].reshape(-1).detach().cpu())
@@ -873,6 +906,9 @@ class Trainer:
 
         gp = cat_or_empty(gate_p)
         gd = cat_or_empty(gate_d)
+        rs = cat_or_empty(rationale_scales)
+        gl = cat_or_empty(global_logits)
+        rd = cat_or_empty(rationale_deltas)
         self.last_eval = {
             "re_f1": re_f1,
             "re_p_f1": re_p_f1,
@@ -890,6 +926,15 @@ class Trainer:
                 float(((gd < 0.1) | (gd > 0.9)).float().mean().item())
                 if gd.numel()
                 else float("nan")
+            ),
+            "rationale_scale": (
+                float(rs.mean().item()) if rs.numel() else float("nan")
+            ),
+            "global_logit_abs_mean": (
+                float(gl.abs().mean().item()) if gl.numel() else float("nan")
+            ),
+            "rationale_delta_abs_mean": (
+                float(rd.abs().mean().item()) if rd.numel() else float("nan")
             ),
         }
 

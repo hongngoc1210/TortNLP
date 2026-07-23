@@ -1,3 +1,12 @@
+"""Stage 1: Claim-Centric Evidence Fusion.
+
+Memory-conscious implementation:
+- Fact tokens are projected once per case, not duplicated for every claim.
+- Fact/opponent retrieval is grouped by case.
+- AMP dtypes are kept consistent before index_copy.
+- ``forward_global`` provides a true TP-only fast path.
+"""
+
 from __future__ import annotations
 
 from typing import Dict, Tuple

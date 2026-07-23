@@ -1,3 +1,14 @@
+"""Stage 3: rationale-guided evidence aggregation with ablation switches.
+
+This implementation is safe under AMP/FP16/BF16.  All indexed writes align
+source and destination dtype/device explicitly, which prevents errors such as:
+
+    index_copy_(): self and source expected to have the same dtype
+
+It also validates claim-to-case maps and keeps the public output interface used
+by the rest of the project.
+"""
+
 from __future__ import annotations
 
 from typing import Dict, Tuple
@@ -33,6 +44,7 @@ class RationalePooling(nn.Module):
         adapter_bottleneck: int = 128,
         adapter_dropout: float = 0.1,
         detach_rationale_for_tp: bool = False,
+        mix_gate_init: float = -1.5,
     ) -> None:
         super().__init__()
 
@@ -85,6 +97,10 @@ class RationalePooling(nn.Module):
             nn.Linear(gate_hidden, 1),
             nn.Sigmoid(),
         )
+        # Start from a fallback-dominant mixture.  The rationale branch is
+        # allowed to gain influence only when it improves TP.
+        nn.init.zeros_(self.mix_gate[3].weight)
+        nn.init.constant_(self.mix_gate[3].bias, float(mix_gate_init))
 
         self.output_norm = nn.LayerNorm(self.hidden)
         self.dropout = nn.Dropout(dropout)

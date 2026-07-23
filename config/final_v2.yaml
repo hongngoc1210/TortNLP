@@ -1,0 +1,147 @@
+seed: 42
+
+data:
+  train_path: "datasets/train001.jsonl"
+
+model:
+  encoder_name: "sbintuitions/modernbert-ja-310m"
+
+  # Keep this small on 16 GB GPUs.  Claim chunks reduce peak workspace but the
+  # computation graph is still retained until backward.
+  claim_chunk_size: 4
+
+  # Stage 1: claim-centric evidence fusion
+  fusion_heads: 4
+  fusion_dropout: 0.1
+  topk_fact_tokens: 16
+  topk_opponents: 3
+
+  # Stage 2: RE heads
+  re_dropout: 0.1
+
+  # Stage 3: TP-specific rationale/fallback pooling
+  topk_claims: 5
+  aggregation_dropout: 0.1
+
+  # Stage 4: global anchor + rationale residual
+  td_num_heads: 4
+  td_dropout: 0.2
+
+training:
+  # Safe profile for ModernBERT-ja-310m on a 16 GB GPU.
+  batch_size: 8
+  grad_accum_steps: 8
+  max_grad_norm: 1.0
+  use_amp: true
+
+  weight_decay: 1.0e-2
+  warmup_ratio: 0.06
+  early_stopping_patience: 5
+
+  # Phase 1 reads these values unless overridden below.
+  epochs: 20
+  lr: 2.0e-5
+  encoder_lr_multiplier: 0.1
+
+loss:
+  # Exactly two losses are retained.
+  weight_re: 0.33
+  weight_tp: 0.67
+  re_side_reduction: mean
+
+teacher_forcing:
+  # Final V2 is trained with predicted rationales.  TP receives detached
+  # probabilities, so teacher forcing is disabled by default.
+  start: 0.0
+  end: 0.0
+  epochs: 1
+
+system:
+  device: "cuda"
+  num_workers: 2
+  save_dir: "outputs/final_v2"
+
+# These are overwritten by train_final_v2.py for each phase, but keeping the
+# final values here also makes the config usable by model factories/evaluation.
+ablation:
+  task_mode: joint
+  tp_input_mode: rationale
+  train_rationale_source: predicted
+  eval_rationale_source: predicted
+
+  use_task_adapters: true
+  adapter_bottleneck: 128
+  adapter_dropout: 0.1
+
+  detach_rationale_for_tp: true
+  use_global_residual: true
+
+  # Both rationale influence controls start at sigmoid(-1.5) ~= 0.18.
+  mix_gate_init: -1.5
+  rationale_scale_init: -1.5
+
+  gradient_method: standard
+  grad_diagnostics_every: 0
+
+phase1:
+  # Optional path to an existing joint_no_rationale/best_model.pt.  Leave null
+  # to train phase 1 from scratch.
+  checkpoint: null
+
+  epochs: 20
+  lr: 2.0e-5
+  encoder_lr_multiplier: 0.1
+  early_stopping_patience: 5
+
+phase2:
+  epochs: 15
+  early_stopping_patience: 5
+
+  # Exact-identity adapters are introduced in phase 2.
+  adapter_bottleneck: 128
+  adapter_dropout: 0.1
+  mix_gate_init: -1.5
+  rationale_scale_init: -1.5
+
+  # Epochs are zero-indexed internally: epochs 0 and 1 train only Stage 3/4.
+  head_warmup_epochs: 2
+
+  # After head warm-up, train Stage-1 fusion and the last N HF encoder blocks.
+  unfreeze_stage1_fusion: true
+  unfreeze_top_encoder_layers: 2
+
+  # Keep the phase-1 RE adapter/heads fixed.  RE loss still regularizes the
+  # shared representation after Stage 1 is partially unfrozen.
+  keep_re_frozen: true
+
+  # Preserve the phase-1 global verdict classifier as a deterministic anchor.
+  freeze_global_anchor: true
+
+  # Named learning-rate groups for phase 2.
+  lr: 2.0e-5
+  encoder_lr: 2.0e-6
+  shared_lr: 1.0e-5
+  re_lr: 2.0e-6
+  tp_pool_lr: 2.0e-5
+  tp_head_lr: 2.0e-5
+  weight_decay: 1.0e-2
+  warmup_ratio: 0.06
+
+  grad_diagnostics_every: 0
+
+  selection:
+    # Prefer TP, but do not accept a large collapse in RE.
+    re_weight: 0.4
+    tp_weight: 0.6
+    max_re_drop: 0.015
+    re_drop_penalty: 5.0
+
+  # Only needed if an external phase-1 checkpoint has no metrics.re_f1.
+  reference_re_f1: null
+
+evaluation:
+  rationale_sources:
+    - predicted
+    - gold
+    - no_rationale
+    - random
