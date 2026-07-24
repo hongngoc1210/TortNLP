@@ -29,8 +29,8 @@ model:
 
 training:
   # Safe profile for ModernBERT-ja-310m on a 16 GB GPU.
-  batch_size: 4
-  grad_accum_steps: 16
+  batch_size: 1
+  grad_accum_steps: 64
   max_grad_norm: 1.0
   use_amp: true
 
