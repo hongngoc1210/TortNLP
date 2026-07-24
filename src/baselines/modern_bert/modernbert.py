@@ -12,11 +12,13 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
+    EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
     set_seed,
@@ -33,6 +35,88 @@ def load_jsonl(path: str) -> List[dict]:
                 continue
             samples.append(json.loads(line))
     return samples
+
+
+
+
+def save_jsonl(rows: List[dict], path: str) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def prepare_train_dev_split(args) -> None:
+    """Create one case-level train/dev split shared by TP and RE.
+
+    A case-level split is important because each case can produce several RE
+    examples. Splitting after expanding claims would leak claims from the same
+    case into both train and dev.
+    """
+    if args.dev_path is not None:
+        print(f"Using provided dev file: {args.dev_path}")
+        return
+
+    raw_cases = load_jsonl(args.train_path)
+    if len(raw_cases) < 2:
+        raise ValueError("At least 2 cases are required to auto-split train/dev.")
+
+    labels = []
+    can_stratify = True
+    for case in raw_cases:
+        label = case.get("court_decision")
+        if label is None:
+            can_stratify = False
+            break
+        labels.append(int(label))
+
+    stratify = None
+    if can_stratify:
+        counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=2)
+        if np.all(counts[counts > 0] >= 2) and np.count_nonzero(counts) >= 2:
+            stratify = labels
+        else:
+            print("Warning: TP labels are too sparse for stratification; using a random case-level split.")
+    else:
+        print("Warning: some cases have no court_decision label; using a random case-level split.")
+
+    try:
+        train_cases, dev_cases = train_test_split(
+            raw_cases,
+            test_size=args.dev_ratio,
+            random_state=args.seed,
+            shuffle=True,
+            stratify=stratify,
+        )
+    except ValueError as exc:
+        if stratify is None:
+            raise
+        print(f"Warning: stratified split failed ({exc}); falling back to a random case-level split.")
+        train_cases, dev_cases = train_test_split(
+            raw_cases,
+            test_size=args.dev_ratio,
+            random_state=args.seed,
+            shuffle=True,
+            stratify=None,
+        )
+
+    split_dir = Path(args.output_root) / "auto_split"
+    train_split_path = split_dir / "train.jsonl"
+    dev_split_path = split_dir / "dev.jsonl"
+    save_jsonl(train_cases, str(train_split_path))
+    save_jsonl(dev_cases, str(dev_split_path))
+
+    args.train_path = str(train_split_path)
+    args.dev_path = str(dev_split_path)
+
+    print("\n========== AUTO TRAIN/DEV SPLIT ==========")
+    print(f"Original cases: {len(raw_cases)}")
+    print(f"Train cases:    {len(train_cases)}")
+    print(f"Dev cases:      {len(dev_cases)}")
+    print(f"Dev ratio:      {args.dev_ratio:.4f}")
+    print(f"Saved train split to: {train_split_path}")
+    print(f"Saved dev split to:   {dev_split_path}")
 
 
 def normalize_case(case: dict) -> dict:
@@ -356,6 +440,11 @@ def train_tp(args, tokenizer) -> str:
             data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
             compute_metrics=compute_tp_metrics,
             class_weights=class_weights,
+            callbacks=[
+                EarlyStoppingCallback(
+                    early_stopping_patience=args.early_stopping_patience
+                )
+            ],
         )
     )
 
@@ -409,6 +498,11 @@ def train_re(args, tokenizer) -> str:
             data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
             compute_metrics=compute_re_metrics,
             class_weights=class_weights,
+            callbacks=[
+                EarlyStoppingCallback(
+                    early_stopping_patience=args.early_stopping_patience
+                )
+            ],
         )
     )
 
@@ -580,14 +674,26 @@ def parse_args():
     parser.add_argument("--re_eval_batch_size", type=int, default=2)
     parser.add_argument("--tp_grad_accum", type=int, default=8)
     parser.add_argument("--re_grad_accum", type=int, default=8)
-    parser.add_argument("--tp_epochs", type=float, default=3)
-    parser.add_argument("--re_epochs", type=float, default=3)
+    parser.add_argument("--tp_epochs", type=float, default=10)
+    parser.add_argument("--re_epochs", type=float, default=10)
     parser.add_argument("--tp_lr", type=float, default=2e-5)
     parser.add_argument("--re_lr", type=float, default=2e-5)
 
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.06)
     parser.add_argument("--logging_steps", type=int, default=20)
+    parser.add_argument(
+        "--dev_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of train cases used as dev when --dev_path is omitted.",
+    )
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=2,
+        help="Stop after this many evaluations without dev F1 improvement.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--bf16", action="store_true")
@@ -602,8 +708,12 @@ def parse_args():
         args.do_train = True
         args.do_predict = True
 
-    if args.do_train and (args.train_path is None or args.dev_path is None):
-        raise ValueError("--train_path and --dev_path are required when --do_train is enabled.")
+    if args.do_train and args.train_path is None:
+        raise ValueError("--train_path is required when --do_train is enabled.")
+    if not 0.0 < args.dev_ratio < 1.0:
+        raise ValueError("--dev_ratio must be between 0 and 1.")
+    if args.early_stopping_patience < 1:
+        raise ValueError("--early_stopping_patience must be at least 1.")
 
     return args
 
@@ -616,6 +726,9 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    if args.do_train:
+        prepare_train_dev_split(args)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
 
