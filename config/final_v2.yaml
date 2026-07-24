@@ -84,6 +84,9 @@ ablation:
   grad_diagnostics_every: 0
 
 phase1:
+  batch_size: 1
+  grad_accum_steps: 64
+
   # Optional path to an existing joint_no_rationale/best_model.pt.  Leave null
   # to train phase 1 from scratch.
   checkpoint: null
@@ -94,6 +97,9 @@ phase1:
   early_stopping_patience: 5
 
 phase2:
+  batch_size: 1
+  grad_accum_steps: 64
+
   epochs: 15
   early_stopping_patience: 5
 
@@ -106,9 +112,10 @@ phase2:
   # Epochs are zero-indexed internally: epochs 0 and 1 train only Stage 3/4.
   head_warmup_epochs: 2
 
-  # After head warm-up, train Stage-1 fusion and the last N HF encoder blocks.
+  # Memory-safe default: adapt Stage-1 fusion while keeping the pretrained
+  # ModernBERT blocks frozen. Try 1 layer only after this run is stable.
   unfreeze_stage1_fusion: true
-  unfreeze_top_encoder_layers: 2
+  unfreeze_top_encoder_layers: 0
 
   # Keep the phase-1 RE adapter/heads fixed.  RE loss still regularizes the
   # shared representation after Stage 1 is partially unfrozen.

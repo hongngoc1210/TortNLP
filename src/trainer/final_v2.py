@@ -293,16 +293,13 @@ def load_phase1_checkpoint(
     stage4: nn.Module,
     device: str | torch.device,
 ) -> dict:
-    """Load a joint-no-rationale checkpoint into the final architecture.
+    """Load Phase-1 weights without retaining a duplicate GPU checkpoint."""
+    del device
 
-    Stage 1 is loaded fully.  RE heads are loaded by compatible keys while the
-    newly introduced exact-identity adapter stays initialized.  Stage 3 is not
-    loaded because it was unused in phase 1.  Only the trained global verdict
-    anchor is loaded from Stage 4.
-    """
     checkpoint = torch.load(
         checkpoint_path,
-        map_location=device,
+        map_location="cpu",
+        weights_only=False,
     )
 
     reports = {}
@@ -327,7 +324,6 @@ def load_phase1_checkpoint(
         "skipped": skipped,
     }
 
-    # Stage 3 is deliberately fresh in phase 2.
     reports["stage3"] = {
         "loaded": 0,
         "skipped": {
@@ -346,8 +342,20 @@ def load_phase1_checkpoint(
         "skipped": skipped,
     }
 
+    metadata = {
+        "epoch": checkpoint.get("epoch"),
+        "metrics": checkpoint.get("metrics", {}),
+        "extra": checkpoint.get("extra", {}),
+        "config": checkpoint.get("config", {}),
+    }
+
+    del stage1_state
+    del stage2_state
+    del stage4_state
+    del checkpoint
+
     return {
-        "checkpoint": checkpoint,
+        "metadata": metadata,
         "load_report": reports,
     }
 
@@ -391,12 +399,24 @@ def load_checkpoint(
     stage4: nn.Module,
     device: str | torch.device,
 ) -> dict:
+    """Load through CPU so the state dict is not duplicated on GPU."""
+    del device
+
     checkpoint = torch.load(
         path,
-        map_location=device,
+        map_location="cpu",
+        weights_only=False,
     )
     stage1.load_state_dict(checkpoint["stage1"])
     stage2.load_state_dict(checkpoint["stage2"])
     stage3.load_state_dict(checkpoint["stage3"])
     stage4.load_state_dict(checkpoint["stage4"])
-    return checkpoint
+
+    metadata = {
+        "epoch": checkpoint.get("epoch"),
+        "metrics": checkpoint.get("metrics", {}),
+        "extra": checkpoint.get("extra", {}),
+        "config": checkpoint.get("config", {}),
+    }
+    del checkpoint
+    return metadata

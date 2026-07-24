@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import json
 import math
 import os
@@ -90,6 +91,32 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.benchmark = False
+
+
+def print_cuda_memory(label: str) -> None:
+    if not torch.cuda.is_available():
+        return
+
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    peak = torch.cuda.max_memory_allocated() / 1024**3
+    print(
+        f"[CUDA:{label}] allocated={allocated:.2f} GiB | "
+        f"reserved={reserved:.2f} GiB | peak={peak:.2f} GiB",
+        flush=True,
+    )
+
+
+def cleanup_memory(label: str | None = None) -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except RuntimeError:
+            pass
+        if label:
+            print_cuda_memory(label)
 
 
 def finite(value) -> bool:
@@ -197,6 +224,18 @@ def phase1_config(base_cfg: dict) -> dict:
         {
             "training": {
                 "epochs": int(phase.get("epochs", 20)),
+                "batch_size": int(
+                    phase.get(
+                        "batch_size",
+                        base_cfg["training"].get("batch_size", 1),
+                    )
+                ),
+                "grad_accum_steps": int(
+                    phase.get(
+                        "grad_accum_steps",
+                        base_cfg["training"].get("grad_accum_steps", 64),
+                    )
+                ),
                 "lr": float(phase.get("lr", 2e-5)),
                 "encoder_lr_multiplier": float(
                     phase.get("encoder_lr_multiplier", 0.1)
@@ -234,6 +273,18 @@ def phase2_config(base_cfg: dict) -> dict:
         {
             "training": {
                 "epochs": int(phase.get("epochs", 15)),
+                "batch_size": int(
+                    phase.get(
+                        "batch_size",
+                        base_cfg["training"].get("batch_size", 1),
+                    )
+                ),
+                "grad_accum_steps": int(
+                    phase.get(
+                        "grad_accum_steps",
+                        base_cfg["training"].get("grad_accum_steps", 64),
+                    )
+                ),
                 "early_stopping_patience": int(
                     phase.get("early_stopping_patience", 5)
                 ),
@@ -421,11 +472,13 @@ def train_phase2(
     save_dir.mkdir(parents=True, exist_ok=True)
     save_yaml(save_dir / "resolved_config.yaml", cfg)
 
+    cleanup_memory("before_phase2_model")
     stages = build_model_stages(
         cfg,
         device=cfg["system"]["device"],
     )
     stage1, stage2, stage3, stage4 = stages
+    print_cuda_memory("after_phase2_model")
 
     transfer = load_phase1_checkpoint(
         phase1_checkpoint,
@@ -437,10 +490,12 @@ def train_phase2(
         transfer["load_report"],
     )
 
-    phase1_metrics = transfer["checkpoint"].get(
+    phase1_metrics = transfer["metadata"].get(
         "metrics",
         {},
     )
+    del transfer
+    cleanup_memory("after_phase1_transfer_cleanup")
     reference_re = phase1_metrics.get("re_f1")
     if not finite(reference_re):
         reference_re = cfg.get("phase2", {}).get(
@@ -475,6 +530,7 @@ def train_phase2(
             num_training_steps=total_updates,
         )
     )
+    print_cuda_memory("after_phase2_optimizer")
     loss_fn = build_multitask_loss(cfg)
     trainer = trainer_from_components(
         stages,
@@ -684,11 +740,6 @@ def main():
         base_cfg,
     )
 
-    # Both phases must use the same split and DataLoader shape.
-    train_loader, dev_loader, test_loader = build_loaders(
-        base_cfg
-    )
-
     explicit_checkpoint = (
         args.phase1_checkpoint
         or base_cfg.get("phase1", {}).get("checkpoint")
@@ -712,18 +763,32 @@ def main():
                 "phase1.checkpoint in config."
             )
         p1_cfg = phase1_config(base_cfg)
+        p1_train_loader, p1_dev_loader, _ = build_loaders(
+            p1_cfg
+        )
         phase1_checkpoint = train_phase1(
             p1_cfg,
-            train_loader,
-            dev_loader,
+            p1_train_loader,
+            p1_dev_loader,
             output_root / "phase1_global",
         )
-
-    # Release phase-1 modules before building the final model.
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        del p1_train_loader
+        del p1_dev_loader
+        cleanup_memory("after_phase1_cleanup")
 
     p2_cfg = phase2_config(base_cfg)
+    train_loader, dev_loader, test_loader = build_loaders(
+        p2_cfg
+    )
+    print(
+        "Phase-2 loader:",
+        {
+            "batch_size": train_loader.batch_size,
+            "grad_accum_steps": p2_cfg["training"]["grad_accum_steps"],
+            "raw_batches": len(train_loader),
+        },
+        flush=True,
+    )
     results = train_phase2(
         p2_cfg,
         phase1_checkpoint,
