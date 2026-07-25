@@ -97,8 +97,8 @@ phase1:
   early_stopping_patience: 5
 
 phase2:
-  batch_size: 1
-  grad_accum_steps: 64
+  batch_size: 2
+  grad_accum_steps: 32
   max_grad_norm: 1.0
 
   epochs: 15
