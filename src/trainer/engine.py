@@ -18,6 +18,22 @@ import torch
 
 from trainer.metrics import compute_re_f1, compute_td_accuracy
 
+def print_cuda_state(tag: str) -> None:
+    if not torch.cuda.is_available():
+        return
+
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    peak = torch.cuda.max_memory_allocated() / 1024**3
+
+    print(
+        f"[CUDA:{tag}] "
+        f"allocated={allocated:.2f} GiB | "
+        f"reserved={reserved:.2f} GiB | "
+        f"peak={peak:.2f} GiB",
+        flush=True,
+    )
+
 
 class Trainer:
     def __init__(
@@ -253,6 +269,7 @@ class Trainer:
     # Forward
     # ------------------------------------------------------------------
 
+
     def _prepare_pooling_inputs(
         self,
         s2: dict,
@@ -291,6 +308,14 @@ class Trainer:
 
         return s2_pool, pooling_mode
 
+    @staticmethod
+    def _module_is_frozen(module: torch.nn.Module) -> bool:
+        return not any(
+            parameter.requires_grad
+            for parameter in module.parameters()
+        )
+
+
     def _forward_batch(
         self,
         batch: dict,
@@ -298,13 +323,30 @@ class Trainer:
         rationale_source: str | None = None,
     ):
         if self.task_mode == "tp_only" and self.tp_input_mode == "global_only":
-            s1 = self.stage1.forward_global(batch)
+            if self._module_is_frozen(self.stage1):
+                with torch.no_grad():
+                    s1 = self.stage1.forward_global(batch)
+            else:
+                s1 = self.stage1.forward_global(batch)
+
             s4 = self.stage4(s1, None, input_mode="global_only")
             return s1, None, None, s4
 
-        s1 = self.stage1(batch)
-        need_re = self.task_mode != "tp_only" or self.tp_input_mode == "rationale"
-        s2 = self.stage2(s1) if need_re else None
+        need_re = (
+            self.task_mode != "tp_only"
+            or self.tp_input_mode == "rationale"
+        )
+
+        stage1_frozen = self._module_is_frozen(self.stage1)
+
+        # Trong phase-2 warm-up, Stage 1/2 đều frozen.
+        if stage1_frozen:
+            with torch.no_grad():
+                s1 = self.stage1(batch)
+                s2 = self.stage2(s1) if need_re else None
+        else:
+            s1 = self.stage1(batch)
+            s2 = self.stage2(s1) if need_re else None
 
         if self.task_mode == "re_only":
             return s1, s2, None, None
@@ -334,8 +376,15 @@ class Trainer:
             source=source,
             eta=eta,
         )
-        s3 = self.stage3(s1, s2_pool, batch, pooling_mode=pooling_mode)
+
+        s3 = self.stage3(
+            s1,
+            s2_pool,
+            batch,
+            pooling_mode=pooling_mode,
+        )
         s4 = self.stage4(s1, s3, input_mode="rationale")
+
         return s1, s2, s3, s4
 
     # ------------------------------------------------------------------
@@ -693,6 +742,55 @@ class Trainer:
             for step, batch in enumerate(loader):
                 batch = self._move_batch(batch)
 
+                if step % 10 == 0:
+                    print_cuda_state(f"step_{step}_before_forward")
+
+                try:
+                    with torch.amp.autocast(
+                        self.device_type,
+                        enabled=self.use_amp,
+                    ):
+                        s1, s2, s3, s4 = self._forward_batch(
+                            batch,
+                            epoch=epoch,
+                        )
+
+                        loss, loss_re, loss_tp = self._compute_task_losses(
+                            s2,
+                            s4,
+                            batch,
+                        )
+
+                        scaled_loss = loss / self.grad_accum_steps
+
+                    self.scaler.scale(scaled_loss).backward()
+
+                except torch.OutOfMemoryError:
+                    print("\n=== OOM BATCH ===", flush=True)
+                    print(f"epoch={epoch}, step={step}", flush=True)
+                    print(f"tort_id={batch.get('tort_id')}", flush=True)
+
+                    for side in ("U", "P", "D"):
+                        ids = batch[f"{side}_input_ids"]
+                        mask = batch[f"{side}_attention_mask"]
+
+                        print(
+                            f"{side}: shape={tuple(ids.shape)}, "
+                            f"valid_tokens={int(mask.sum().item())}, "
+                            f"max_row_tokens={int(mask.sum(dim=1).max().item()) if mask.size(0) else 0}",
+                            flush=True,
+                        )
+
+                    print_cuda_state("oom")
+                    print(
+                        torch.cuda.memory_summary(abbreviated=True),
+                        flush=True,
+                    )
+                    raise
+
+                if step % 10 == 0:
+                    print_cuda_state(f"step_{step}_after_backward")
+
                 if step % 50 == 0:
                     num_u = batch["U_input_ids"].size(0)
                     num_p = batch["P_input_ids"].size(0)
@@ -782,10 +880,23 @@ class Trainer:
                         totals["optimizer_steps"] += 1
                         accumulated_micro_steps = 0
 
-                totals["loss"] += float(loss.detach().float().item())
-                totals["loss_re"] += float(loss_re.detach().float().item())
-                totals["loss_tp"] += float(loss_tp.detach().float().item())
+                loss_value = float(loss.detach().float().item())
+                loss_re_value = float(loss_re.detach().float().item())
+                loss_tp_value = float(loss_tp.detach().float().item())
+
+                totals["loss"] += loss_value
+                totals["loss_re"] += loss_re_value
+                totals["loss_tp"] += loss_tp_value
                 totals["steps"] += 1
+
+                # Không để output batch cũ sống trong lúc forward batch tiếp theo.
+                del s1, s2, s3, s4
+                del loss, loss_re, loss_tp
+
+                if self.gradient_method == "standard":
+                    del scaled_loss
+
+                del batch
 
         if self.gradient_method == "standard" and accumulated_micro_steps > 0:
             correction = self.grad_accum_steps / accumulated_micro_steps
