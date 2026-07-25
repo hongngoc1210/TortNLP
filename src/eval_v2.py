@@ -35,24 +35,47 @@ def to_binary(value, field_name: str, tort_id: str) -> int:
     )
 
 
-def binary_f1(gold: list[int], pred: list[int]) -> float:
+def binary_f1(
+    gold: list[int],
+    pred: list[int],
+    *,
+    empty_value: float = 0.0,
+) -> float:
     if len(gold) != len(pred):
         raise ValueError(
             f"F1 input length mismatch: gold={len(gold)}, pred={len(pred)}"
         )
 
-    tp = sum(g == 1 and p == 1 for g, p in zip(gold, pred))
-    fp = sum(g == 0 and p == 1 for g, p in zip(gold, pred))
-    fn = sum(g == 1 and p == 0 for g, p in zip(gold, pred))
+    tp = sum(
+        g == 1 and p == 1
+        for g, p in zip(gold, pred)
+    )
+    fp = sum(
+        g == 0 and p == 1
+        for g, p in zip(gold, pred)
+    )
+    fn = sum(
+        g == 1 and p == 0
+        for g, p in zip(gold, pred)
+    )
 
     denominator = 2 * tp + fp + fn
-    return 0.0 if denominator == 0 else (2 * tp) / denominator
+
+    if denominator == 0:
+        return float(empty_value)
+
+    return (2 * tp) / denominator
+
+
+def safe_mean(values: list[float]) -> float:
+    return sum(values) / max(len(values), 1)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a minimal TortNLP submission against labeled JSONL."
+            "Evaluate a TortNLP submission against labeled JSONL. "
+            "Reports both per-case macro metrics and global claim-level F1."
         )
     )
     parser.add_argument(
@@ -79,8 +102,10 @@ def main() -> None:
         for record in submission_records
     }
 
-    duplicate_check = len(pred_by_id) != len(submission_records)
-    if duplicate_check:
+    if len(gold_by_id) != len(gold_records):
+        raise ValueError("Gold file contains duplicate tort_id values.")
+
+    if len(pred_by_id) != len(submission_records):
         raise ValueError("Submission contains duplicate tort_id values.")
 
     missing = sorted(set(gold_by_id) - set(pred_by_id))
@@ -99,12 +124,27 @@ def main() -> None:
         )
 
     correct_tort = 0
-    instance_f1_all: list[float] = []
-    instance_f1_p: list[float] = []
-    instance_f1_d: list[float] = []
 
-    global_gold: list[int] = []
-    global_pred: list[int] = []
+    # Per-case scores: used to diagnose instance-macro evaluation.
+    macro_all_empty0: list[float] = []
+    macro_all_empty1: list[float] = []
+    macro_p_empty0: list[float] = []
+    macro_p_empty1: list[float] = []
+    macro_d_empty0: list[float] = []
+    macro_d_empty1: list[float] = []
+
+    # Global claim arrays: likely closer to many training evaluators.
+    global_gold_all: list[int] = []
+    global_pred_all: list[int] = []
+    global_gold_p: list[int] = []
+    global_pred_p: list[int] = []
+    global_gold_d: list[int] = []
+    global_pred_d: list[int] = []
+
+    no_gold_positive = 0
+    both_empty = 0
+    total_p_claims = 0
+    total_d_claims = 0
 
     for tort_id, gold in gold_by_id.items():
         pred = pred_by_id[tort_id]
@@ -159,36 +199,92 @@ def main() -> None:
                 f"gold={len(gold_d)}, pred={len(pred_d)}"
             )
 
+        total_p_claims += len(gold_p)
+        total_d_claims += len(gold_d)
+
         gold_all = gold_p + gold_d
         pred_all = pred_p + pred_d
 
-        instance_f1_all.append(binary_f1(gold_all, pred_all))
-        instance_f1_p.append(binary_f1(gold_p, pred_p))
-        instance_f1_d.append(binary_f1(gold_d, pred_d))
+        if sum(gold_all) == 0:
+            no_gold_positive += 1
 
-        global_gold.extend(gold_all)
-        global_pred.extend(pred_all)
+        if sum(gold_all) == 0 and sum(pred_all) == 0:
+            both_empty += 1
+
+        macro_all_empty0.append(
+            binary_f1(gold_all, pred_all, empty_value=0.0)
+        )
+        macro_all_empty1.append(
+            binary_f1(gold_all, pred_all, empty_value=1.0)
+        )
+
+        macro_p_empty0.append(
+            binary_f1(gold_p, pred_p, empty_value=0.0)
+        )
+        macro_p_empty1.append(
+            binary_f1(gold_p, pred_p, empty_value=1.0)
+        )
+
+        macro_d_empty0.append(
+            binary_f1(gold_d, pred_d, empty_value=0.0)
+        )
+        macro_d_empty1.append(
+            binary_f1(gold_d, pred_d, empty_value=1.0)
+        )
+
+        global_gold_all.extend(gold_all)
+        global_pred_all.extend(pred_all)
+        global_gold_p.extend(gold_p)
+        global_pred_p.extend(pred_p)
+        global_gold_d.extend(gold_d)
+        global_pred_d.extend(pred_d)
 
     n_cases = len(gold_records)
     tort_accuracy = correct_tort / max(n_cases, 1)
-    rationale_f1_all = sum(instance_f1_all) / max(n_cases, 1)
-    rationale_f1_p = sum(instance_f1_p) / max(n_cases, 1)
-    rationale_f1_d = sum(instance_f1_d) / max(n_cases, 1)
-    rationale_micro_f1 = binary_f1(global_gold, global_pred)
 
-    print("=" * 58)
+    global_f1_all = binary_f1(
+        global_gold_all,
+        global_pred_all,
+        empty_value=0.0,
+    )
+    global_f1_p = binary_f1(
+        global_gold_p,
+        global_pred_p,
+        empty_value=0.0,
+    )
+    global_f1_d = binary_f1(
+        global_gold_d,
+        global_pred_d,
+        empty_value=0.0,
+    )
+
+    print("=" * 66)
     print("COLIEE LJPJT local evaluation")
-    print("=" * 58)
-    print(f"Cases                         : {n_cases}")
-    print(f"Tort Prediction accuracy      : {tort_accuracy:.6f}")
-    print(f"Rationale F1 All (official)   : {rationale_f1_all:.6f}")
-    print(f"Rationale F1 Plaintiff        : {rationale_f1_p:.6f}")
-    print(f"Rationale F1 Defendant        : {rationale_f1_d:.6f}")
-    print(f"Rationale micro-F1 diagnostic : {rationale_micro_f1:.6f}")
-    print("=" * 58)
+    print("=" * 66)
+    print(f"Cases                                  : {n_cases}")
+    print(f"Plaintiff claims                       : {total_p_claims}")
+    print(f"Defendant claims                       : {total_d_claims}")
+    print(f"Cases with no gold-positive rationale  : {no_gold_positive}")
+    print(f"Cases where gold and prediction empty  : {both_empty}")
+    print("-" * 66)
+    print(f"Tort Prediction accuracy               : {tort_accuracy:.6f}")
+    print("-" * 66)
+    print("Per-case macro F1")
+    print(f"  All, empty case -> 0                 : {safe_mean(macro_all_empty0):.6f}")
+    print(f"  All, empty case -> 1                 : {safe_mean(macro_all_empty1):.6f}")
+    print(f"  Plaintiff, empty case -> 0           : {safe_mean(macro_p_empty0):.6f}")
+    print(f"  Plaintiff, empty case -> 1           : {safe_mean(macro_p_empty1):.6f}")
+    print(f"  Defendant, empty case -> 0           : {safe_mean(macro_d_empty0):.6f}")
+    print(f"  Defendant, empty case -> 1           : {safe_mean(macro_d_empty1):.6f}")
+    print("-" * 66)
+    print("Global claim-level F1")
+    print(f"  All claims                           : {global_f1_all:.6f}")
+    print(f"  Plaintiff claims                     : {global_f1_p:.6f}")
+    print(f"  Defendant claims                     : {global_f1_d:.6f}")
+    print("=" * 66)
     print(
-        "Note: when a case has no gold-positive and no predicted-positive "
-        "claims, this local script assigns F1=0."
+        "Do not label either empty-case convention as official until it "
+        "is confirmed against the official evaluator."
     )
 
 
