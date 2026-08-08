@@ -9,9 +9,11 @@ Joint Rationale Extraction and Tort Determination for Japanese civil law cases.
 ```
 .
 ├── config/
-│   └── config.yaml            # All hyperparameters
+│   ├── config.yaml                    # Base hyperparameters
+│   └── final_v2_single_phase.yaml     # End-to-end Final V2 training
 ├── src/
-│   ├── main.py                # Single-GPU training & evaluation
+│   ├── main.py                # Two-phase Final V2 training
+│   ├── main_v2.py             # Single-phase Final V2 training
 │   ├── main_2x.py             # 2-GPU DDP training
 │   ├── inference.py           # Standalone inference on test set
 │   ├── models/
@@ -252,3 +254,17 @@ python src/main.py \
 ```
 
 The previous single-phase entry point is retained as `src/main_legacy.py`.
+
+### Final V2 single-phase training
+
+To build the complete Final V2 architecture once and train it end-to-end in a
+single continuous run, use:
+
+```bash
+python src/main_v2.py --config config/final_v2_single_phase.yaml
+```
+
+This run does not create or transfer a Phase-1 checkpoint and does not apply
+the Phase-2 freeze/unfreeze schedule. By default, artifacts are written to
+`outputs/final_v2_single_phase/`. Use `--run-name` to select a different output
+subdirectory.

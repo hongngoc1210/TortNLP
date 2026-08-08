@@ -1,0 +1,85 @@
+seed: 42
+
+data:
+  train_path: "datasets/train001.jsonl"
+
+model:
+  encoder_name: "sbintuitions/modernbert-ja-310m"
+
+  # Memory-safe defaults for a 16 GB GPU.
+  claim_chunk_size: 4
+
+  # Stage 1: claim-centric evidence fusion.
+  fusion_heads: 4
+  fusion_dropout: 0.1
+  topk_fact_tokens: 16
+  topk_opponents: 3
+
+  # Stage 2: rationale extraction.
+  re_dropout: 0.1
+
+  # Stage 3: TP-specific rationale/fallback pooling.
+  topk_claims: 5
+  aggregation_dropout: 0.1
+
+  # Stage 4: global anchor plus rationale residual.
+  td_num_heads: 4
+  td_dropout: 0.2
+
+training:
+  # One model is built and optimized continuously for all epochs.
+  epochs: 25
+  batch_size: 1
+  grad_accum_steps: 64
+  max_grad_norm: 1.0
+  use_amp: true
+
+  lr: 2.0e-5
+  encoder_lr_multiplier: 0.1
+  weight_decay: 1.0e-2
+  warmup_ratio: 0.06
+  early_stopping_patience: 5
+
+loss:
+  weight_re: 0.33
+  weight_tp: 0.67
+  re_side_reduction: mean
+
+teacher_forcing:
+  # The single-phase Final V2 run always consumes predicted rationales.
+  start: 0.0
+  end: 0.0
+  epochs: 1
+
+system:
+  device: "cuda"
+  num_workers: 2
+  # main_v2.py appends --run-name to this directory.
+  save_dir: "outputs"
+
+ablation:
+  task_mode: joint
+  tp_input_mode: rationale
+  train_rationale_source: predicted
+  eval_rationale_source: predicted
+
+  # Build the complete Final V2 architecture from epoch 1.
+  use_task_adapters: true
+  adapter_bottleneck: 128
+  adapter_dropout: 0.1
+  detach_rationale_for_tp: true
+  use_global_residual: true
+  mix_gate_init: -1.5
+  rationale_scale_init: -1.5
+
+  gradient_method: standard
+  grad_diagnostics_every: 0
+
+evaluation:
+  selection_metric: mean
+  compare_rationale_sources: true
+  rationale_sources:
+    - predicted
+    - gold
+    - no_rationale
+    - random
